@@ -1,0 +1,22 @@
+# === Dota Companion: базовые зависимости ===
+PyQt6>=6.7
+aiohttp>=3.9
+mss>=9.0
+Pillow>=10.3
+numpy>=1.26
+
+# === Звук (SoundPad) ===
+sounddevice>=0.4.6
+soundfile>=0.12.1      # WAV / FLAC / OGG
+imageio-ffmpeg>=0.4.7  # MP3 (эталонный декодер ffmpeg, как у Windows Player)
+miniaudio>=1.59        # MP3 (fallback)
+
+# === OCR: вариант A — PaddleOCR (китайский/английский/испанский) ===
+# Тяжёлый, но лучший для игрового чата. Устанавливается отдельно:
+#   pip install paddlepaddle paddleocr
+# Если не установлен — автоматический fallback на Tesseract (вариант B).
+
+# === OCR: вариант B — Tesseract (fallback) ===
+# Нужен сам Tesseract 5 в системе: https://github.com/UB-Mannheim/tesseract/wiki
+# + языковые пакеты chi_sim, eng, spa (в папку tessdata)
+pytesseract>=0.3.10

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Настройки и данные приложения
+settings.json
+*.log
+
+# Сборка
+build/
+dist/
+*.spec
+
+# IDE
+.idea/
+.vscode/
