@@ -22,6 +22,7 @@ class GsiSignals(QObject):
     player_update = pyqtSignal(dict)                             
     roster_update = pyqtSignal(dict)                             
     server_error = pyqtSignal(str)
+    server_steam_id_found = pyqtSignal(str)
 
 
 class GsiServer:
@@ -94,6 +95,11 @@ class GsiServer:
             log.info("Матч завершён (matchid сброшен в 0)")
             self._current_match_id = None
             self.signals.match_ended.emit()
+
+        # server_steam_id — уникальный ID игрового сервера для Steam Web API
+        server_steam_id = str(match.get("server_steam_id") or "").strip()
+        if server_steam_id and server_steam_id != "0":
+            self.signals.server_steam_id_found.emit(server_steam_id)
 
         state = match.get("game_state", "")
         if state and state != self._last_state:

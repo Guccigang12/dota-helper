@@ -68,6 +68,7 @@ class Settings:
                     
     gsi_port: int = 34567
     gsi_auth_token: str = ""
+    steam_api_key: str = ""
     console_log_path: str = ""                                     
 
                  

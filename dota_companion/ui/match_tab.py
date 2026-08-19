@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -138,6 +139,20 @@ class MatchTab(QWidget):
         toolbar.addWidget(refresh_btn)
         root.addLayout(toolbar)
 
+        # Steam API Key
+        api_row = QHBoxLayout()
+        api_row.setSpacing(8)
+        api_label = dim_label("Steam API Key:")
+        self._steam_key_input = QLineEdit(self._settings.steam_api_key)
+        self._steam_key_input.setPlaceholderText("Для GetRealtimeStats (опционально)")
+        self._steam_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._steam_key_input.setMaximumWidth(360)
+        self._steam_key_input.editingFinished.connect(self._on_steam_key_changed)
+        api_row.addWidget(api_label)
+        api_row.addWidget(self._steam_key_input)
+        api_row.addStretch(1)
+        root.addLayout(api_row)
+
                          
         teams = QHBoxLayout()
         teams.setSpacing(12)
@@ -183,6 +198,10 @@ class MatchTab(QWidget):
 
     def _on_currency_changed(self) -> None:
         self._settings.market_currency = self._currency_combo.currentData()
+        self.settings_changed.emit()
+
+    def _on_steam_key_changed(self) -> None:
+        self._settings.steam_api_key = self._steam_key_input.text().strip()
         self.settings_changed.emit()
 
                                                                           

@@ -22,7 +22,7 @@ CHAT_RE = re.compile(
 STEAMID64_RE = re.compile(r"\b(7656119\d{10})\b")
 STEAMID3_RE = re.compile(r"\[U:1:(\d{5,10})\]")
 ACCOUNT_ID_RE = re.compile(r"\bAccount\s*ID\s*[:=]\s*(\d{5,10})\b", re.IGNORECASE)
-STATUS_PLAYER_A = re.compile(r"\[Client\]\s+(\d{1,2})\s+\S+\s+\d+\s+\d+\s+\w+\s+\d+\s+'([^']+)'")
+STATUS_PLAYER_A = re.compile(r"\[Client\]\s+(\d{1,2})\s+.*?'([^']+)'")
 STATUS_PLAYER_B = re.compile(r"\[Client\]\s*(?:#\s*)?(\d{1,2})?\s*\d*\s+[\"']([^\"']+)[\"']\s+\[U:1:(\d{5,10})\]")
 STATUS_PLAYER_C = re.compile(r"\[Client\]\s*(?:#\s*)?(\d{1,2})?\s*\d*\s+[\"']([^\"']+)[\"']\s+(7656119\d{10})")
 MATCH_ID_RE = re.compile(r"Lobby MatchID:\s*(\d{8,12})")
@@ -57,6 +57,13 @@ class ConsoleLogTailer(QThread):
     def stop(self) -> None:
         self._stop_event.set()
         self.wait(3000)
+
+    def reset(self) -> None:
+        """Сброс состояния парсера при старте нового матча."""
+        self._status_buffer.clear()
+        self._last_status_key = None
+        self._offset = None
+        self._current_match_id = None
 
     def run(self) -> None:
         while not self._stop_event.is_set():

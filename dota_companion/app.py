@@ -20,6 +20,8 @@ from .dota.console_log import ConsoleLogTailer
 from .dota.gsi_server import GsiServer
 from .dota.match_state import MatchState, Player, STEAM_ID64_OFFSET, sanitize_name
 from .dota import opendota
+from .dota import steam_api
+from .dota.steam_api import fetch_realtime_stats
 from .market.client import MarketClient
 from .market.models import InventoryValue
 from .ocr.capturer import ScreenCapturer
@@ -94,6 +96,7 @@ class DotaCompanionApplication(QObject):
         self.heroes: dict[int, str] = {}
         self.match_state = MatchState()
         self._current_match_id: int | None = None
+        self._server_steam_id: str | None = None
 
         self._last_ocr_text = ""
         self._last_notify_ts = 0.0
@@ -194,6 +197,7 @@ class DotaCompanionApplication(QObject):
         self.gsi.signals.game_state_changed.connect(self._on_game_state)
         self.gsi.signals.roster_update.connect(self._on_gsi_roster)
         self.gsi.signals.server_error.connect(self._on_gsi_error)
+        self.gsi.signals.server_steam_id_found.connect(self._on_server_steam_id)
         self._submit("gsi-start", self.gsi.start(), lambda ok, _res: self._on_gsi_started())
 
                                      
@@ -265,7 +269,12 @@ class DotaCompanionApplication(QObject):
 
     def _on_match_started(self, match_id: int) -> None:
         self._current_match_id = match_id
+        self._server_steam_id = None
         self.match_state = MatchState(match_id=match_id)
+        if hasattr(self, '_realtime_timer'):
+            self._realtime_timer.stop()
+        if hasattr(self, 'tailer'):
+            self.tailer.reset()
         status = f"Матч {match_id} · Автоматический подхват Steam ID…"
         self.match_tab.set_status(status)
         self.window.set_status(status)
@@ -322,10 +331,64 @@ class DotaCompanionApplication(QObject):
     def _on_match_ended(self) -> None:
         """Игра закончилась (matchid сброшен в 0) — ростер и оценки остаются на экране."""
         log.info("Матч завершён по GSI")
+        if hasattr(self, '_realtime_timer'):
+            self._realtime_timer.stop()
+        self._server_steam_id = None
         n = len(self.match_state.players)
         status = f"Матч окончен · {n} игроков в ростере"
         self.match_tab.set_status(status)
         self.window.set_status(status)
+
+    def _on_server_steam_id(self, server_steam_id: str) -> None:
+        """Получен server_steam_id из GSI — настраиваем периодический опрос GetRealtimeStats."""
+        if server_steam_id == self._server_steam_id:
+            return
+        self._server_steam_id = server_steam_id
+        log.info("server_steam_id: %s", server_steam_id)
+
+        if not self.settings.steam_api_key:
+            log.debug("steam_api_key не задан — пропускаем GetRealtimeStats")
+            return
+
+        if not hasattr(self, '_realtime_timer'):
+            self._realtime_timer = QTimer(self)
+            self._realtime_timer.timeout.connect(self._poll_realtime_stats)
+        self._realtime_timer.setInterval(15_000)
+        self._realtime_timer.start()
+        # Первый опрос — сразу
+        self._poll_realtime_stats()
+
+    def _poll_realtime_stats(self) -> None:
+        """Запрос GetRealtimeStats через Steam Web API для получения account_id всех игроков."""
+        if not self._server_steam_id or not self.settings.steam_api_key:
+            return
+
+        async def _do_poll():
+            session = await self._get_dota_session()
+            return await fetch_realtime_stats(
+                session, self._server_steam_id, self.settings.steam_api_key
+            )
+
+        def _on_result(ok: bool, players: list[Player]) -> None:
+            if not ok or not players:
+                return
+            # Подставляем hero_name
+            for p in players:
+                if p.hero_id and not p.hero_name:
+                    p.hero_name = self.heroes.get(p.hero_id, "")
+            self.match_state.set_players(players)
+            self.match_state.sort_players()
+            self.match_tab.set_players(self.match_state.players)
+            status = f"Матч {self._current_match_id or ''} · {len(self.match_state.players)} игроков (Steam API)"
+            self.match_tab.set_status(status)
+            self.window.set_status(status)
+
+            # Оцениваем тех, у кого есть account_id и ещё нет оценки
+            for player in self.match_state.players:
+                if player.account_id and player.account_id > 0 and player.value_status != "ok":
+                    self.evaluate_player(player)
+
+        self._submit("realtime-stats", _do_poll(), _on_result)
 
     def _on_auto_evaluate_toggled(self, enabled: bool) -> None:
         """Включили «Авто-оценку» — оцениваем тех, у кого ещё нет стоимости."""
@@ -366,22 +429,9 @@ class DotaCompanionApplication(QObject):
 
             p = self.match_state.player_by_account(account_id)
             if p is None:
-                unassigned = [
-                    pl for pl in self.match_state.players
-                    if (pl.account_id is None or pl.account_id <= 0) and not pl.is_local
-                ]
-                if unassigned:
-                    p = unassigned[0]
-                    p.account_id = account_id
-                    if p.name.startswith("Игрок ") or p.name.startswith("Player ") or not p.name:
-                        p.name = f"Игрок {account_id}"
-                    updated = True
-
-                    self._submit(
-                        "player-name",
-                        self._fetch_player_name(account_id),
-                        lambda ok, res_name, target_p=p: self._on_player_name_ready(target_p, res_name) if (ok and res_name) else None,
-                    )
+                # Не назначаем случайный Steam ID на первый попавшийся слот —
+                # ждём подтверждения от GSI-ростера или Steam API
+                continue
 
             if p and p.steam_id64 and p.value_status != "ok":
                 self.evaluate_player(p)
@@ -526,7 +576,13 @@ class DotaCompanionApplication(QObject):
                 continue
             if player.account_id and player.account_id > 0:
                 self.evaluate_player(player)
-            elif player.name and not player.name.startswith("Игрок ") and not player.name.startswith("Player ") and not player.name == "Вы":
+            elif (
+                player.name
+                and len(player.name) >= 3
+                and not player.name.startswith("Игрок ")
+                and not player.name.startswith("Player ")
+                and player.name != "Вы"
+            ):
                 self._submit(
                     f"search-{player.name}",
                     self._fetch_player_by_search(player.name),
@@ -541,10 +597,7 @@ class DotaCompanionApplication(QObject):
         session = await self._get_dota_session()
         return await opendota.fetch_player_by_search(session, name)
 
-    async def _load_heroes(self) -> None:
-        session = await self._get_dota_session()
-        self.heroes = await opendota.fetch_heroes(session)
-        log.info("Загружено героев: %d", len(self.heroes))
+    # _load_heroes определён выше (строка ~294), дубликат удалён
 
     async def _load_match(self, match_id: int) -> list:
         session = await self._get_dota_session()
@@ -620,18 +673,7 @@ class DotaCompanionApplication(QObject):
             lambda ok, result: self._on_value_ready(player, result) if ok else self._on_value_error(player, result),
         )
 
-    def _on_player_search_done(self, player: Player, account_id: int | None) -> None:
-        if account_id and account_id > 0:
-            player.account_id = account_id
-            msg = f"Найден Steam ID для {player.name}: {player.steam_id64}"
-            self.match_tab.set_status(msg)
-            self.window.set_status(msg)
-            self.evaluate_player(player)
-        else:
-            player.value_status = ""
-            msg = f"Не удалось найти Steam ID по нику '{player.name}' (укажите ссылку на профиль по кнопке 'Оценить')"
-            self.match_tab.set_status(msg)
-            self.window.set_status(msg)
+    # Дубликат _on_player_search_done удалён — используется определение выше (~строка 463)
 
     def _on_value_ready(self, player, value: InventoryValue) -> None:
         player.inventory_value = value.amount

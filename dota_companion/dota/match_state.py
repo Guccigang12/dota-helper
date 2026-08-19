@@ -119,7 +119,7 @@ class MatchState:
                     if inc_name_generic and old_name_custom:
                         inc_p.name = old_p.name
 
-                    if (inc_p.account_id is None or inc_p.account_id <= 0) and old_p.account_id:
+                    if (inc_p.account_id is None or inc_p.account_id <= 0) and old_p.account_id and old_p.account_id > 0:
                         inc_p.account_id = old_p.account_id
 
                     if old_p.value_status == "ok":
