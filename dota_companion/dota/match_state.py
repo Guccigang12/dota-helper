@@ -123,9 +123,14 @@ class MatchState:
                         inc_p.account_id = old_p.account_id
 
                     if old_p.value_status == "ok":
+                        # Сохраняем успешную оценку инвентаря
                         inc_p.item_id = old_p.item_id
                         inc_p.inventory_value = old_p.inventory_value
                         inc_p.currency = old_p.currency
+                        inc_p.value_status = old_p.value_status
+                        inc_p.value_error = old_p.value_error
+                    elif old_p.value_status in ("loading", "error"):
+                        # ВАЖНО: сохраняем loading/error — не даём GSI тику сбросить статус и зациклить поиск
                         inc_p.value_status = old_p.value_status
                         inc_p.value_error = old_p.value_error
 

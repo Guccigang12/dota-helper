@@ -1,5 +1,3 @@
-
-   
 from __future__ import annotations
 
 import os
@@ -21,10 +19,10 @@ SUPPORTED = {".wav", ".mp3", ".ogg", ".flac"}
 
 class AudioBackend:
     def __init__(
-        self,
-        device_name: str = "",
-        master_volume: float = 0.8,
-        voice_volume: float = 1.0,
+            self,
+            device_name: str = "",
+            master_volume: float = 0.8,
+            voice_volume: float = 1.0,
     ) -> None:
         self._device_name = device_name
         self._master_volume = float(master_volume)
@@ -32,8 +30,6 @@ class AudioBackend:
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[np.ndarray, int]] = {}
         self._cache_lock = threading.Lock()
-
-                                                                          
 
     @property
     def device_name(self) -> str:
@@ -47,15 +43,13 @@ class AudioBackend:
             self._master_volume = float(master)
             self._voice_volume = float(voice)
 
-                                                                          
-
     def list_output_devices(self) -> list[str]:
-                                                                    
+
         try:
             import sounddevice as sd
 
             devices = sd.query_devices()
-        except Exception as exc:                
+        except Exception as exc:
             log.warning("sounddevice недоступен: %s", exc)
             return []
         result = []
@@ -64,8 +58,20 @@ class AudioBackend:
                 result.append(f"{i}: {dev['name']}")
         return result
 
+    def _get_device_channels(self, device_idx: int | None) -> int:
+        """Возвращает количество каналов output-устройства (макс. 2)."""
+        if device_idx is None:
+            return 2
+        try:
+            import sounddevice as sd
+            dev = sd.query_devices(device_idx)
+            ch = int(dev.get("max_output_channels", 2))
+            return max(1, min(ch, 2))
+        except Exception:
+            return 2
+
     def _resolve_device_index(self) -> int | None:
-                                                                                   
+
         name = self._device_name.strip()
         if not name:
             return None
@@ -73,10 +79,9 @@ class AudioBackend:
             import sounddevice as sd
 
             devices = sd.query_devices()
-        except Exception:                
+        except Exception:
             return None
 
-                                                 
         if ":" in name:
             try:
                 idx = int(name.split(":", 1)[0])
@@ -85,17 +90,14 @@ class AudioBackend:
             except ValueError:
                 pass
 
-                                                                               
         lowered = name.lower()
         for i, dev in enumerate(devices):
             if dev.get("max_output_channels", 0) > 0 and lowered in dev["name"].lower():
                 return i
         return None
 
-                                                                          
-
     def play(self, path: str, volume: float | None = None) -> bool:
-                                                                                  
+
         file_path = Path(path)
         if not file_path.is_file():
             log.warning("Файл не найден: %s", path)
@@ -132,27 +134,37 @@ class AudioBackend:
             import sounddevice as sd
 
             device = self._resolve_device_index()
-            channels = data.shape[1] if data.ndim > 1 else 1
+            device_channels = self._get_device_channels(device)
+
+            # Подгоняем каналы аудио под устройство
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+            audio_channels = data.shape[1]
+
+            if audio_channels != device_channels:
+                if device_channels == 1 and audio_channels > 1:
+                    # стерео → моно
+                    data = data.mean(axis=1, keepdims=True)
+                elif device_channels == 2 and audio_channels == 1:
+                    # моно → стерео
+                    data = np.repeat(data, 2, axis=1)
+
             stream = sd.OutputStream(
                 samplerate=sample_rate,
                 device=device,
-                channels=channels,
+                channels=device_channels,
                 dtype="float32",
             )
             with stream:
-                                                                           
                 chunk = max(1024, int(sample_rate * 0.05))
                 for start in range(0, len(data), chunk):
-                    stream.write((data[start : start + chunk] * gain).astype("float32"))
-        except Exception as exc:                
+                    stream.write((data[start: start + chunk] * gain).astype("float32"))
+        except Exception as exc:
             log.warning("Ошибка воспроизведения %s: %s", path, exc)
-
-                                                                          
 
     @staticmethod
     def _decode(path: str) -> tuple[np.ndarray | None, int]:
 
-           
         suffix = Path(path).suffix.lower()
         decode_path, temp_copy = path, None
 
@@ -193,7 +205,7 @@ class AudioBackend:
                 return samples, int(decoded.sample_rate) or 48000
         except ImportError as exc:
             log.warning("Нет декодера для %s (%s). Установи soundfile/miniaudio.", suffix, exc)
-        except Exception as exc:                
+        except Exception as exc:
             log.warning("Не удалось декодировать %s: %s", path, exc)
         finally:
             if temp_copy is not None:

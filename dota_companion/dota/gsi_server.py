@@ -156,6 +156,7 @@ class GsiServer:
         players = data.get("player", {}) or {}
         heroes = data.get("hero", {}) or {}
         provider = data.get("provider", {}) or {}
+        allplayers = data.get("allplayers", {}) or {}  # Все 10 игроков (турбо и все режимы)
 
         local_name = str(players.get("name") or "").strip()
         try:
@@ -164,6 +165,55 @@ class GsiServer:
             local_steam_id64 = 0
 
         result: list[dict] = []
+
+        # ------------------------------------------------------------------
+        # Приоритет 1: allplayers — самый надёжный источник для Турбо и всех
+        # режимов. Ключи: "player0".."player9", каждый содержит steamid, name,
+        # team_name ("radiant"/"dire"). Появляется при "allplayers" "1" в GSI.
+        # ------------------------------------------------------------------
+        if isinstance(allplayers, dict) and allplayers:
+            for i in range(10):
+                p_info = allplayers.get(f"player{i}", {}) or {}
+                if not isinstance(p_info, dict):
+                    continue
+
+                steam_id64 = 0
+                try:
+                    steam_id64 = int(p_info.get("steamid") or 0)
+                except (TypeError, ValueError):
+                    pass
+
+                name = str(p_info.get("name") or "").strip()
+                if not name:
+                    name = f"Игрок {i + 1}"
+
+                is_radiant = str(p_info.get("team_name") or "").lower() != "dire"
+
+                hero_id = None
+                # Герой берётся из allplayers (если есть) или из heroes.team2/team3
+                hero_raw = p_info.get("hero", {}) or {}
+                if isinstance(hero_raw, dict):
+                    hero_id = hero_raw.get("id")
+                if hero_id is None:
+                    # Пробуем взять из hero.teamX.playerN
+                    team_key = "team2" if is_radiant else "team3"
+                    slot_key = f"player{i}"
+                    h_info = (heroes.get(team_key, {}) or {}).get(slot_key, {}) or {}
+                    if isinstance(h_info, dict):
+                        hero_id = h_info.get("id")
+                if isinstance(hero_id, str) and hero_id.isdigit():
+                    hero_id = int(hero_id)
+
+                result.append({
+                    "steam_id64": steam_id64,
+                    "name": name,
+                    "hero_id": hero_id if isinstance(hero_id, int) else None,
+                    "is_radiant": is_radiant,
+                    "slot": i,
+                })
+
+            if result:
+                return result
 
         team2_players = players.get("team2", {}) if isinstance(players, dict) else {}
         team3_players = players.get("team3", {}) if isinstance(players, dict) else {}

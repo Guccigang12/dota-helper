@@ -1,16 +1,22 @@
-"""Обёртка над Steam Web API: IDOTA2MatchStats_570/GetRealtimeStats."""
+"""Обёртка над Steam Web API: IDOTA2MatchStats_570/GetRealtimeStats + ISteamUser."""
 
 from __future__ import annotations
 
 import aiohttp
 
-from .match_state import Player, ANONYMOUS_ACCOUNT_ID, sanitize_name
+from .match_state import Player, ANONYMOUS_ACCOUNT_ID, sanitize_name, STEAM_ID64_OFFSET
 from ..core.logger import get_logger
 
 log = get_logger("steam_api")
 
 REALTIME_STATS_URL = (
     "https://api.steampowered.com/IDOTA2MatchStats_570/GetRealtimeStats/v1"
+)
+RESOLVE_VANITY_URL = (
+    "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1"
+)
+GET_PLAYER_SUMMARIES_URL = (
+    "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2"
 )
 
 
@@ -63,3 +69,68 @@ async def fetch_realtime_stats(
 
     log.info("GetRealtimeStats: получено %d игроков (server_steam_id=%s)", len(players), server_steam_id)
     return players
+
+
+async def resolve_vanity_url(
+    session: aiohttp.ClientSession,
+    vanity: str,
+    api_key: str,
+) -> int | None:
+    """Пробует разрезолвить Steam vanity URL → account_id.
+
+    Работает если игрок использует ник как кастомный URL профиля.
+    Возвращает account_id (32-бит) или None.
+    """
+    if not api_key or not vanity:
+        return None
+    try:
+        async with session.get(
+            RESOLVE_VANITY_URL,
+            params={"key": api_key, "vanityurl": vanity},
+            timeout=aiohttp.ClientTimeout(total=4),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+        r = data.get("response", {})
+        if r.get("success") == 1:
+            steam_id64 = int(r["steamid"])
+            account_id = steam_id64 - STEAM_ID64_OFFSET
+            if account_id > 0:
+                log.info("ResolveVanityURL '%s' → account_id=%d", vanity, account_id)
+                return account_id
+    except Exception as exc:
+        log.debug("ResolveVanityURL ошибка для '%s': %s", vanity, exc)
+    return None
+
+
+async def search_player_by_name(
+    session: aiohttp.ClientSession,
+    name: str,
+    api_key: str,
+) -> int | None:
+    """Поиск account_id через Steam API (ResolveVanityURL) с несколькими вариантами ника.
+
+    Порядок попыток:
+    1. name — точный ник
+    2. name.lower() — строчный вариант
+    3. name без пробелов
+    4. name.lower() без пробелов
+
+    Возвращает account_id или None если не найдено.
+    """
+    if not api_key or not name:
+        return None
+
+    variants: list[str] = []
+    for v in [name, name.lower(), name.replace(" ", ""), name.lower().replace(" ", "")]:
+        if v and v not in variants:
+            variants.append(v)
+
+    for variant in variants:
+        acc_id = await resolve_vanity_url(session, variant, api_key)
+        if acc_id:
+            return acc_id
+
+    log.debug("Steam API: не найден игрок '%s' ни в одном варианте", name)
+    return None
