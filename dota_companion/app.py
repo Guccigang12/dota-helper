@@ -1,27 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from pathlib import Path
 
-import aiohttp
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
-from PyQt6.QtGui import QCursor
+from PyQt6.QtGui import QCursor, QImage
 from PyQt6.QtWidgets import QApplication
+from PIL import Image
 
 from .core.async_worker import AsyncWorker
 from .core.hotkeys import HotkeyManager
 from .core.logger import configure_logging, get_logger
-from .core.settings import Settings, ChatRegion, get_config_dir, get_data_dir
-from .dota.console_log import ConsoleLogTailer
-from .dota.gsi_server import GsiServer
-from .dota.match_state import MatchState, Player, STEAM_ID64_OFFSET, sanitize_name
-from .dota import opendota
-from .dota import steam_api
-from .dota.steam_api import fetch_realtime_stats, search_player_by_name
-from .market.client import MarketClient
-from .market.models import InventoryValue
+from .core.settings import ChatRegion, Settings, get_config_dir, get_data_dir
 from .ocr.capturer import ScreenCapturer
 from .ocr.engine import OcrEngine
 from .ocr.translator import Translator
@@ -31,15 +22,12 @@ from .ui.chat_overlay import ChatOverlay
 from .ui.chat_tab import ChatTab
 from .ui.crop_overlay import CropOverlay
 from .ui.main_window import MainWindow
-from .ui.match_tab import MatchTab
 from .ui.soundpad_overlay import SoundPadOverlay
 from .ui.soundpad_tab import SoundPadTab
-from .ui.translator_tab import TranslatorTab
 from .ui.theme import apply_theme
+from .ui.translator_tab import TranslatorTab
 
 log = get_logger("app")
-
-GAME_STATE_ACTIVE = "DOTA_GAMERULES_STATE_HERO_SELECTION"
 
 
 class _ResultBridge(QObject):
@@ -47,7 +35,6 @@ class _ResultBridge(QObject):
 
 
 class DotaCompanionApplication(QObject):
-
     def __init__(self, qapp: QApplication) -> None:
         super().__init__()
         self.qapp = qapp
@@ -64,6 +51,7 @@ class DotaCompanionApplication(QObject):
             device_name=self.settings.audio_device,
             master_volume=self.settings.master_volume,
             voice_volume=self.settings.voice_volume,
+            monitor_enabled=getattr(self.settings, "soundpad_monitor", True),
         )
         self.capturer = ScreenCapturer()
         self.engine = OcrEngine(lang=self.settings.ocr_lang)
@@ -75,43 +63,33 @@ class DotaCompanionApplication(QObject):
             target_lang=self.settings.target_lang,
             gemini_api_key=self.settings.gemini_api_key,
             gemini_model=self.settings.gemini_model,
-        )
-        self.market = MarketClient(
-            token=self.settings.market_token,
-            currency=self.settings.market_currency,
-            app_id=self.settings.market_app_id,
-            ignore_cache=self.settings.market_ignore_cache,
-            min_interval=self.settings.market_min_interval,
+            custom_api_url=self.settings.custom_api_url,
+            custom_api_key=self.settings.custom_api_key,
+            custom_model=self.settings.custom_model,
+            groq_api_key=self.settings.groq_api_key,
+            groq_model=self.settings.groq_model,
+            openrouter_api_key=self.settings.openrouter_api_key,
+            openrouter_model=self.settings.openrouter_model,
+            deepseek_api_key=self.settings.deepseek_api_key,
+            deepseek_model=self.settings.deepseek_model,
+            slang_enhancement=self.settings.slang_enhancement,
         )
         self.hotkeys = HotkeyManager(self)
-
-        self.gsi: GsiServer | None = None
-        self._dota_session: aiohttp.ClientSession | None = None
-        self.heroes: dict[int, str] = {}
-        self.match_state = MatchState()
-        self._current_match_id: int | None = None
-        self._server_steam_id: str | None = None
-        self._pending_steam_ids: set[int] = set()  # Буфер: Steam ID из консоли до появления ростера
 
         self._last_ocr_text = ""
         self._last_notify_ts = 0.0
         self._bridges: set[_ResultBridge] = set()
 
-        self.match_tab = MatchTab(self.settings)
         self.chat_tab = ChatTab(self.settings)
         self.translator_tab = TranslatorTab(self.settings)
         self.soundpad_tab = SoundPadTab(self.settings, self.audio.list_output_devices)
         self.window = MainWindow(
-            self.settings, self.match_tab, self.chat_tab, self.translator_tab, self.soundpad_tab
+            self.settings, self.chat_tab, self.translator_tab, self.soundpad_tab
         )
 
         self.chat_overlay = ChatOverlay(self.settings)
         self.soundpad_overlay = SoundPadOverlay(self.settings)
-        self.crop_overlay: CropOverlay | None = None
-
-        self._ocr_timer = QTimer(self)
-        self._ocr_timer.timeout.connect(self._capture_frame)
-        self._ocr_timer.setInterval(self.settings.ocr_interval_ms)
+        self.crop_overlays: list[CropOverlay] = []
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -122,17 +100,11 @@ class DotaCompanionApplication(QObject):
         self._reload_triggers()
 
     def _wire_signals(self) -> None:
-
         self.hotkeys.calibrate_region.connect(self.open_crop_overlay)
-        self.hotkeys.toggle_pause.connect(self._on_pause_hotkey)
+        self.hotkeys.translate_chat.connect(self.translate_chat_region)
         self.hotkeys.exit_app.connect(self._on_exit)
 
-        self.match_tab.evaluate_requested.connect(self.evaluate_player)
-        self.match_tab.refresh_roster_requested.connect(self._on_refresh_roster)
-        self.match_tab.auto_evaluate_toggled.connect(self._on_auto_evaluate_toggled)
-        self.match_tab.settings_changed.connect(self._on_settings_changed)
-
-        self.chat_tab.ocr_toggle_requested.connect(self._set_ocr_active)
+        self.chat_tab.translate_requested.connect(self.translate_chat_region)
         self.chat_tab.region_requested.connect(self.open_crop_overlay)
         self.chat_tab.settings_changed.connect(self._on_settings_changed)
 
@@ -140,649 +112,95 @@ class DotaCompanionApplication(QObject):
         self.translator_tab.settings_changed.connect(self._on_settings_changed)
 
         self.soundpad_tab.play_requested.connect(self.audio.play)
+        self.soundpad_tab.stop_requested.connect(self.audio.stop)
         self.soundpad_tab.refresh_requested.connect(self._reload_triggers)
         self.soundpad_tab.settings_changed.connect(self._on_settings_changed)
         self.soundpad_tab.show_overlay_requested.connect(self._show_soundpad_overlay)
 
         self.soundpad_overlay.play_requested.connect(self.audio.play)
+        self.soundpad_overlay.stop_requested.connect(self.audio.stop)
         self.soundpad_overlay.refresh_requested.connect(self._reload_triggers)
         self.soundpad_overlay.volume_changed.connect(self._on_overlay_volume)
+        self.soundpad_overlay.scale_changed.connect(self._on_overlay_scale)
+        self.soundpad_overlay.triggers_changed.connect(self._on_overlay_triggers_changed)
         self.soundpad_overlay.close_requested.connect(self._hide_soundpad_overlay)
 
         self.window.quit_requested.connect(self._on_exit)
-        self.window.pause_toggled.connect(self._on_pause_hotkey)
+        self.window.translate_chat_requested.connect(self.translate_chat_region)
         self.window.crop_requested.connect(self.open_crop_overlay)
         self.window.soundpad_overlay_toggled.connect(self._set_soundpad_overlay_visible)
 
         self.engine.signals.text_ready.connect(self._on_ocr_text)
         self.engine.signals.error.connect(lambda msg: self.window.set_status(msg))
+        self.engine.signals.backend_changed.connect(
+            lambda name: self.window.set_status(f"OCR-движок: {name}")
+        )
+
+    def _get_active_model_name(self) -> str:
+        p = self.settings.translator_provider
+        if p == "ollama":
+            return self.settings.custom_model
+        elif p == "groq":
+            return self.settings.groq_model
+        elif p == "openrouter":
+            return self.settings.openrouter_model
+        elif p == "deepseek":
+            return self.settings.deepseek_model
+        elif p == "gemini":
+            return self.settings.gemini_model
+        return ""
 
     def start(self) -> None:
-        log.info("Запуск Dota Companion")
+        log.info("Запуск Dota Companion (Soundpad + Переводчик)")
 
         self.worker.start()
         if not self.worker.wait_ready(10):
             log.error("Event loop не запустился")
             return
 
-        self.gsi = GsiServer(
-            self.worker.loop,
-            port=self.settings.gsi_port,
-            auth_token=self.settings.gsi_auth_token,
-        )
-        self.gsi_signals = self.gsi.signals
-        self.gsi.signals.match_started.connect(self._on_match_started)
-        self.gsi.signals.match_ended.connect(self._on_match_ended)
-        self.gsi.signals.game_state_changed.connect(self._on_game_state)
-        self.gsi.signals.roster_update.connect(self._on_gsi_roster)
-        self.gsi.signals.server_error.connect(self._on_gsi_error)
-        self.gsi.signals.server_steam_id_found.connect(self._on_server_steam_id)
-        self._submit("gsi-start", self.gsi.start(), lambda ok, _res: self._on_gsi_started())
-
-        self.worker.submit("heroes", self._load_heroes())
-
         self.engine.start()
-        self.tailer = ConsoleLogTailer(self._console_log_path)
-        self.tailer.signals.chat_line.connect(self._on_log_chat)
-        self.tailer.signals.steam_ids.connect(self._on_console_steam_ids)
-        self.tailer.signals.status_players.connect(self._on_console_status_players)
-        self.tailer.signals.status.connect(
-            lambda msg, is_err: self.window.set_status(msg)
-        )
-        self.tailer.start()
         self.hotkeys.start()
-
-        self.engine.set_paused(not (self.settings.ocr_enabled and not self.settings.ocr_paused))
-        if self.settings.ocr_enabled and not self.settings.ocr_paused:
-            self._ocr_timer.start()
 
         self.chat_overlay.apply_settings()
         if self.settings.soundpad_overlay_visible:
             self.soundpad_overlay.show()
 
         self.window.show()
-        self.window.set_status("Dota Companion готов. Хоткеи: Ctrl+Shift+F8 — область чата, F9 — пауза, F10 — выход")
+        self.window.set_status(
+            "Dota Companion готов. Хоткеи: F8 — перевести чат, Ctrl+Shift+F8 — задать область, F10 — выход"
+        )
 
     def shutdown(self) -> None:
         log.info("Завершение работы")
+        self._close_crop_overlays()
         try:
             self.settings.save()
         except Exception:
             pass
 
-        self._ocr_timer.stop()
         self.engine.stop()
-        if getattr(self, "tailer", None) is not None:
-            self.tailer.stop()
         self.hotkeys.stop()
         self.capturer.close()
+        try:
+            self.audio.close()
+        except Exception:
+            pass
 
-        if self.gsi is not None and self.worker.isRunning():
-            try:
-                self.worker.submit("gsi-stop", self.gsi.stop())
-            except RuntimeError:
-                pass
         if self.worker.isRunning():
             self.worker.submit("close-sessions", self._close_sessions())
         self.worker.stop()
         self.window.force_close()
 
-    def _on_gsi_started(self, _result=None) -> None:
-        self.window.set_status(f"GSI-сервер активен на порту {self.settings.gsi_port}")
-
-    def _on_gsi_error(self, message: str) -> None:
-        self.window.set_status(message)
-        self.window.show_tray_message("Dota Companion", message)
-
-    def _on_game_state(self, state: str) -> None:
-        log.debug("game_state: %s", state)
-        self.window.set_status(f"Игровое состояние: {state}")
-
-    def _on_match_started(self, match_id: int) -> None:
-        self._current_match_id = match_id
-        self._server_steam_id = None
-        self._pending_steam_ids = set()  # Сбрасываем буфер при новом матче
-        self.match_state = MatchState(match_id=match_id)
-        if hasattr(self, '_realtime_timer'):
-            self._realtime_timer.stop()
-        if hasattr(self, 'tailer'):
-            self.tailer.reset()
-        status = f"Матч {match_id} · Автоматический подхват Steam ID…"
-        self.match_tab.set_status(status)
-        self.window.set_status(status)
-        log.info("Новый матч %s: авто-загрузка ростера и Steam ID", match_id)
-        self._submit(
-            "match-fetch",
-            self._load_match_and_live(match_id),
-            lambda ok, res: self._on_roster_ready(ok, res, match_id),
-        )
-
-    def _on_live_match_ready(self, ok: bool, result, match_id: int) -> None:
-        if match_id != self._current_match_id:
-            return
-        if ok and result:
-            log.info("Live-данные матча %s: получено %d игроков с никами", match_id, len(result))
-            self.match_state.set_players(result)
-            self.match_state.sort_players()
-            self.match_tab.set_players(self.match_state.players)
-            status = f"Матч {match_id} · {len(self.match_state.players)} игроков с никами"
-            self.match_tab.set_status(status)
-            self.window.set_status(status)
-            for player in self.match_state.players:
-                if player.account_id and player.account_id > 0 and player.value_status != "ok":
-                    self.evaluate_player(player)
-
-    async def _load_heroes(self) -> None:
-        session = await self._get_dota_session()
-        self.heroes = await opendota.fetch_heroes(session)
-        log.info("Загружено героев: %d", len(self.heroes))
-
-    async def _load_match_and_live(self, match_id: int) -> list[Player]:
-        session = await self._get_dota_session()
-        if not self.heroes:
-            self.heroes = await opendota.fetch_heroes(session)
-
-        match_players = await opendota.fetch_match(session, match_id, self.heroes)
-        if match_players and len(match_players) >= 2:
-            return match_players
-
-        for attempt in range(4):
-            try:
-                live_players = await opendota.fetch_live_match(session, match_id, self.heroes)
-                if live_players and len(live_players) >= 2:
-                    return live_players
-            except Exception:
-                pass
-            await asyncio.sleep(2.5)
-
-        return match_players or []
-
-    async def _load_live_match(self, match_id: int) -> list[Player]:
-        return await self._load_match_and_live(match_id)
-
-    def _on_match_ended(self) -> None:
-        """Игра закончилась (matchid сброшен в 0) — ростер и оценки остаются на экране."""
-        log.info("Матч завершён по GSI")
-        if hasattr(self, '_realtime_timer'):
-            self._realtime_timer.stop()
-        self._server_steam_id = None
-        n = len(self.match_state.players)
-        status = f"Матч окончен · {n} игроков в ростере"
-        self.match_tab.set_status(status)
-        self.window.set_status(status)
-
-    def _on_server_steam_id(self, server_steam_id: str) -> None:
-        """Получен server_steam_id из GSI — настраиваем периодический опрос GetRealtimeStats."""
-        if server_steam_id == self._server_steam_id:
-            return
-        self._server_steam_id = server_steam_id
-        log.info("server_steam_id: %s", server_steam_id)
-
-        if not self.settings.steam_api_key:
-            log.debug("steam_api_key не задан — пропускаем GetRealtimeStats")
-            return
-
-        if not hasattr(self, '_realtime_timer'):
-            self._realtime_timer = QTimer(self)
-            self._realtime_timer.timeout.connect(self._poll_realtime_stats)
-        self._realtime_timer.setInterval(15_000)
-        self._realtime_timer.start()
-        # Первый опрос — сразу
-        self._poll_realtime_stats()
-
-    def _poll_realtime_stats(self) -> None:
-        """Запрос GetRealtimeStats через Steam Web API для получения account_id всех игроков."""
-        if not self._server_steam_id or not self.settings.steam_api_key:
-            return
-
-        async def _do_poll():
-            session = await self._get_dota_session()
-            return await fetch_realtime_stats(
-                session, self._server_steam_id, self.settings.steam_api_key
-            )
-
-        def _on_result(ok: bool, players: list[Player]) -> None:
-            if not ok or not players:
-                return
-            # Подставляем hero_name
-            for p in players:
-                if p.hero_id and not p.hero_name:
-                    p.hero_name = self.heroes.get(p.hero_id, "")
-            self.match_state.set_players(players)
-            self.match_state.sort_players()
-            self.match_tab.set_players(self.match_state.players)
-            status = f"Матч {self._current_match_id or ''} · {len(self.match_state.players)} игроков (Steam API)"
-            self.match_tab.set_status(status)
-            self.window.set_status(status)
-
-            # Оцениваем тех, у кого есть account_id и ещё нет оценки
-            for player in self.match_state.players:
-                if player.account_id and player.account_id > 0 and player.value_status != "ok":
-                    self.evaluate_player(player)
-
-        self._submit("realtime-stats", _do_poll(), _on_result)
-
-    def _on_auto_evaluate_toggled(self, enabled: bool) -> None:
-        """Включили «Авто-оценку» — оцениваем тех, у кого ещё нет стоимости."""
-        if not enabled:
-            return
-        if not self.match_state.players:
-            return
-        for player in self.match_state.players:
-            if player.value_status != "ok":
-                self.evaluate_player(player)
-
-    def _on_console_steam_ids(self, steam_ids: list[str]) -> None:
-        """Обнаружение Steam ID из console.log и автоматическое привязывание к нераспределенным слотам."""
-        if not steam_ids:
-            return
-
-        # Если ростер ещё не пришёл — буферизуем Steam ID для позднейшей обработки
-        if not self.match_state.players:
-            for s_id in steam_ids:
-                try:
-                    steam_id64 = int(s_id)
-                    account_id = steam_id64 - STEAM_ID64_OFFSET
-                    if account_id > 0:
-                        self._pending_steam_ids.add(account_id)
-                except ValueError:
-                    pass
-            log.debug("Буферизовано %d Steam ID (ростер ещё не готов)", len(self._pending_steam_ids))
-            return
-
-        local_p = next((pl for pl in self.match_state.players if pl.is_local), None)
-        updated = False
-
-        for s_id in steam_ids:
-            try:
-                steam_id64 = int(s_id)
-                account_id = steam_id64 - STEAM_ID64_OFFSET
-            except ValueError:
-                continue
-
-            if account_id <= 0:
-                continue
-
-            # Если это локальный игрок (вы) — привязываем строго к вашему слоту!
-            if local_p and (local_p.account_id is None or local_p.account_id == account_id):
-                if local_p.account_id != account_id:
-                    local_p.account_id = account_id
-                    updated = True
-                if local_p.value_status != "ok":
-                    self.evaluate_player(local_p)
-                continue
-
-            p = self.match_state.player_by_account(account_id)
-            if p is None:
-                # Сохраняем в буфер на случай позднейшей привязки
-                self._pending_steam_ids.add(account_id)
-                continue
-
-            if p and p.steam_id64 and p.value_status != "ok":
-                self.evaluate_player(p)
-                updated = True
-
-        if updated:
-            self.match_state.sort_players()
-            self.match_tab.set_players(self.match_state.players)
-            status = f"Матч {self._current_match_id or ''} · {len(self.match_state.players)} игроков (Steam ID подтянуты)"
-            self.match_tab.set_status(status)
-            self.window.set_status(status)
-
-    def _on_console_status_players(self, data: dict) -> None:
-        """Обработка списка 10 игроков, выведенного командой status в консоли Dota 2."""
-        match_id = data.get("match_id")
-        parsed_players = data.get("players") or []
-        if not parsed_players:
-            return
-
-        key = (match_id, tuple((p["slot"], p["name"]) for p in parsed_players))
-        if hasattr(self, "_last_status_key") and self._last_status_key == key:
-            return
-        self._last_status_key = key
-
-        if match_id and match_id != self._current_match_id:
-            self._current_match_id = match_id
-
-        # Определяем локального игрока по имени из существующего ростера
-        local_name = None
-        local_p_existing = next((pl for pl in self.match_state.players if pl.is_local), None)
-        if local_p_existing:
-            local_name = sanitize_name(local_p_existing.name).lower()
-
-        # Строим новый ростер по слотам из status — это самый надёжный источник никнеймов
-        # Слоты 1-5 → Radiant, 6-10 → Dire (стандартный порядок status в Dota 2)
-        new_players: list[Player] = []
-        for p_info in sorted(parsed_players, key=lambda x: x["slot"]):
-            slot = p_info["slot"]
-            name = p_info["name"]
-            is_radiant = p_info["is_radiant"]
-            parsed_acc_id = p_info.get("account_id")
-
-            # Ищем этого игрока в существующем ростере чтобы сохранить account_id и оценку
-            existing = self.match_state.player_by_name(name)
-            if existing is None and parsed_acc_id:
-                existing = self.match_state.player_by_account(parsed_acc_id)
-
-            account_id = None
-            hero_id = None
-            hero_name = ""
-            value_status = ""
-            inventory_value = None
-            currency = ""
-            value_error = ""
-            is_local = False
-
-            if existing:
-                account_id = existing.account_id
-                hero_id = existing.hero_id
-                hero_name = existing.hero_name
-                value_status = existing.value_status
-                inventory_value = existing.inventory_value
-                currency = existing.currency
-                value_error = existing.value_error
-                is_local = existing.is_local
-
-            # Если account_id пришёл из status — используем его
-            if parsed_acc_id and (account_id is None or account_id <= 0):
-                account_id = parsed_acc_id
-
-            # Определяем локального игрока по имени
-            if local_name and sanitize_name(name).lower() == local_name:
-                is_local = True
-
-            p = Player(
-                account_id=account_id,
-                name=name,
-                hero_id=hero_id,
-                hero_name=hero_name,
-                is_radiant=is_radiant,
-                is_local=is_local,
-            )
-            p.value_status = value_status
-            p.inventory_value = inventory_value
-            p.currency = currency
-            p.value_error = value_error
-            new_players.append(p)
-
-        if not new_players:
-            return
-
-        # Полностью заменяем ростер — status даёт правильный порядок игроков
-        self.match_state.players = new_players
-        self.match_state.sort_players()
-        self.match_tab.set_players(self.match_state.players)
-        status = f"Матч {self._current_match_id or ''} · {len(new_players)} игроков из команды status"
-        self.match_tab.set_status(status)
-        self.window.set_status(status)
-
-        # Запускаем оценку или поиск Steam ID для каждого игрока
-        for p in self.match_state.players:
-            if p.value_status == "ok":
-                continue
-            if p.account_id and p.account_id > 0:
-                self.evaluate_player(p)
-            elif not p.is_local and p.name and len(p.name) >= 2:
-                self._submit(
-                    f"search-{p.name}",
-                    self._fetch_player_by_search(p.name),
-                    lambda ok, acc_id, target_p=p: self._on_player_search_done(target_p, acc_id if ok else None),
-                )
-
-    def _on_player_search_done(self, player: Player, account_id: int | None) -> None:
-        """Поиск по нику завершён — устанавливаем account_id и оцениваем инвентарь."""
-        if account_id and account_id > 0:
-            player.account_id = account_id
-            log.info("Игрок '%s' найден через OpenDota Search: account_id = %d", player.name, account_id)
-            self.match_tab.update_player(player)
-            self.evaluate_player(player)
-        else:
-            log.warning("Игрок '%s' не найден через OpenDota Search", player.name)
-
-    def _on_log_chat_roster(self, channel: str, name: str, text: str) -> None:
-        """Вспомогательный метод: привязка игрока по нику из чата (вызывается из _on_log_chat)."""
-        log.info("Чат [%s] %s: %s", channel, name, text)
-        if name and not name.startswith("Игрок ") and not name.startswith("Player ") and name != "Вы":
-            # Если игрок с таким ником уже есть в ростере — просто оцениваем
-            existing = self.match_state.player_by_name(name)
-            if existing and existing.account_id and existing.value_status != "ok":
-                self.evaluate_player(existing)
-                return
-            # Иначе ищем по нику
-            unassigned = [pl for pl in self.match_state.players if pl.account_id is None or pl.account_id <= 0]
-            if unassigned:
-                target_p = self.match_state.player_by_name(name) or unassigned[0]
-                if not self.match_state.player_by_name(name):
-                    target_p.name = name
-                self._submit(
-                    f"search-{name}",
-                    self._fetch_player_by_search(name),
-                    lambda ok, acc_id, p=target_p: self._on_player_search_done(p, acc_id if ok else None),
-                )
-
-    def _on_player_name_ready(self, player: Player, name: str) -> None:
-        if name:
-            player.name = name
-            self.match_tab.update_player(player)
-
-    def _on_gsi_roster(self, data: dict) -> None:
-        """Ростер 10 игроков прямо из GSI (реальное время)."""
-        roster = data.get("players") or []
-        local_steam_id64 = data.get("local_steam_id64")
-        players: list[Player] = []
-        for info in roster:
-            raw_steam_id = info.get("steam_id64") or 0
-            account_id = (raw_steam_id - STEAM_ID64_OFFSET) if raw_steam_id > 0 else None
-            hero_id = info.get("hero_id")
-            name = sanitize_name(info.get("name")) or (
-                f"Player {account_id}" if account_id else f"Игрок {info.get('slot', 0) + 1}")
-            players.append(
-                Player(
-                    account_id=account_id,
-                    name=name,
-                    hero_id=hero_id,
-                    hero_name=self.heroes.get(hero_id, "") if hero_id else "",
-                    is_radiant=info.get("is_radiant", True),
-                    is_local=local_steam_id64 is not None and raw_steam_id == local_steam_id64,
-                )
-            )
-        if not players:
-            return
-        self.match_state.set_players(players)
-        self.match_state.sort_players()
-        self.match_tab.set_players(self.match_state.players)
-        if self._current_match_id is not None:
-            status = f"Матч {self._current_match_id} · {len(self.match_state.players)} игроков (GSI)"
-        else:
-            status = f"Ростер: {len(self.match_state.players)} игроков (GSI)"
-        self.match_tab.set_status(status)
-        self.window.set_status(status)
-
-        # Применяем буферизованные Steam ID из консоли
-        if self._pending_steam_ids:
-            applied = False
-            for account_id in list(self._pending_steam_ids):
-                p = self.match_state.player_by_account(account_id)
-                if p is not None and p.value_status != "ok":
-                    self.evaluate_player(p)
-                    self._pending_steam_ids.discard(account_id)
-                    applied = True
-            if applied:
-                log.info("Применены буферизованные Steam ID после появления ростера GSI")
-
-        # Оцениваем всех игроков — evaluate_player сам решит искать по ID или по нику
-        for player in self.match_state.players:
-            if player.value_status in ("ok", "loading", "error"):
-                continue
-            self.evaluate_player(player)
-
-    async def _fetch_player_name(self, account_id: int) -> str | None:
-        session = await self._get_dota_session()
-        return await opendota.fetch_player_name(session, account_id)
-
-    async def _find_player_account_id(self, name: str) -> int | None:
-        "Поиск account_id: сначала Steam API (ResolveVanityURL), потом OpenDota."
-        session = await self._get_dota_session()
-        if self.settings.steam_api_key:
-            acc_id = await search_player_by_name(session, name, self.settings.steam_api_key)
-            if acc_id:
-                log.info("Steam API нашёл '%s' -> account_id=%d", name, acc_id)
-                return acc_id
-            log.debug("Steam API не нашёл '%s', пробуем OpenDota", name)
-        acc_id = await opendota.fetch_player_by_search(session, name)
-        if acc_id:
-            log.info("OpenDota нашёл '%s' -> account_id=%d", name, acc_id)
-        return acc_id
-
-    async def _fetch_player_by_search(self, name: str) -> int | None:
-        session = await self._get_dota_session()
-        return await opendota.fetch_player_by_search(session, name)
-
-    # _load_heroes определён выше (строка ~294), дубликат удалён
-
-    async def _load_match(self, match_id: int) -> list:
-        session = await self._get_dota_session()
-        if not self.heroes:
-            self.heroes = await opendota.fetch_heroes(session)
-        return await opendota.fetch_match(session, match_id, self.heroes)
-
-    async def _get_dota_session(self) -> aiohttp.ClientSession:
-        if self._dota_session is None or self._dota_session.closed:
-            self._dota_session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=25),
-                headers={"User-Agent": "DotaCompanion/1.0"},
-            )
-        return self._dota_session
-
     async def _close_sessions(self) -> None:
-        if self._dota_session is not None and not self._dota_session.closed:
-            await self._dota_session.close()
         await self.translator.close()
-        await self.market.close()
 
-    def _on_roster_ready(self, ok: bool, result, match_id: int) -> None:
-        if match_id != self._current_match_id:
-            return
-        if not ok:
-            return
-        players = result
-        self.match_state.set_players(players)
-        self.match_state.sort_players()
-        self.match_tab.set_players(self.match_state.players)
-        self.match_tab.set_status(f"Матч {self._current_match_id} · {len(self.match_state.players)} игроков")
-
-        if self.match_tab.auto_evaluate_enabled():
-            for player in self.match_state.players:
-                self.evaluate_player(player)
-
-    def _on_refresh_roster(self) -> None:
-        if not self.match_state.players:
-            msg = "Ростер пуст — дождитесь начала матча"
-            self.match_tab.set_status(msg)
-            self.window.set_status(msg)
-            return
-
-        n = len(self.match_state.players)
-        msg = f"Переоценка всех {n} игроков…"
-        self.match_tab.set_status(msg)
-        self.window.set_status(msg)
-        for player in self.match_state.players:
-            player.value_status = ""  # сброс — разрешаем повторный поиск
-            player.value_error = ""
-            self.evaluate_player(player)
-
-    def evaluate_player(self, player) -> None:
-        """Оценка всего Steam-инвентаря игрока по его профилю."""
-        # Не дублируем запрос если уже грузится или уже есть результат
-        if player.value_status == "loading":
-            return
-
-        player.currency = self.settings.market_currency
-
-        if player.steam_id64 is None or player.account_id is None or player.account_id <= 0:
-            # Нет Steam ID — ищем через Steam API, потом OpenDota как fallback
-            name = player.name
-            generic = not name or name.startswith("Игрок ") or name.startswith("Player ") or name == "Вы"
-            if not generic and len(name) >= 2:
-                player.value_status = "loading"
-                self.match_tab.update_player(player)
-                msg = f"Поиск Steam ID для '{name}'..."
-                self.match_tab.set_status(msg)
-                self.window.set_status(msg)
-                log.info(msg)
-                self._submit(
-                    f"search-eval-{name}",
-                    self._find_player_account_id(name),
-                    lambda ok, acc_id, p=player: self._on_search_then_evaluate(p, acc_id if ok else None),
-                )
-            else:
-                player.value_status = ""
-                player.value_error = ""
-                self.match_tab.update_player(player)
-                msg = f"Игрок '{name}': Steam ID не привязан (нет ника для поиска)"
-                self.window.set_status(msg)
-            return
-
-        self.match_tab.set_player_loading(player)
-        msg = f"Запрос инвентаря на Lolzteam Market для {player.name}..."
-        self.match_tab.set_status(msg)
-        self.window.set_status(msg)
-        log.info(msg)
-
-        self._submit(
-            f"market-eval-{player.account_id}",
-            self.market.get_inventory_value_by_link(player.steam_id64),
-            lambda ok, result: self._on_value_ready(player, result) if ok else self._on_value_error(player, result),
-        )
-
-    def _on_search_then_evaluate(self, player: Player, account_id: int | None) -> None:
-        """Получен account_id после поиска по нику — сразу оцениваем инвентарь."""
-        if account_id and account_id > 0:
-            player.account_id = account_id
-            log.info("Найден account_id=%d для '%s', запускаем оценку инвентаря", account_id, player.name)
-            self.match_tab.update_player(player)
-            # Сбрасываем статус чтобы evaluate_player прошёл проверку
-            player.value_status = ""
-            self.evaluate_player(player)
-        else:
-            player.value_status = "error"
-            player.value_error = (
-                "Steam ID не найден автоматически. "
-                "Введите 'status' в консоли Dota 2 (~) — все Steam ID подтянутся мгновенно."
-            )
-            self.match_tab.update_player(player)
-            msg = f"'{player.name}': Steam ID не найден — введите 'status' в консоли Dota 2"
-            self.match_tab.set_status(msg)
-            self.window.set_status(msg)
-            log.warning(msg)
-
-    # Дубликат _on_player_search_done удалён — используется определение выше (~строка 463)
-
-    def _on_value_ready(self, player, value: InventoryValue) -> None:
-        player.inventory_value = value.amount
-        player.currency = value.currency
-        player.value_status = "ok"
-        player.value_error = ""
-        self.match_tab.update_player(player)
-        msg = f"{player.name}: инвентарь ≈ {value.formatted()}"
-        self.match_tab.set_status(msg)
-        self.window.set_status(msg)
-        log.info(msg)
-
-    def _on_value_error(self, player, error: Exception) -> None:
-        player.value_status = "error"
-        player.value_error = str(error)
-        self.match_tab.update_player(player)
-        msg = f"Ошибка оценки {player.name}: {error}"
-        self.match_tab.set_status(msg)
-        self.window.set_status(msg)
-        log.warning(msg)
-
-    def _capture_frame(self) -> None:
+    def translate_chat_region(self) -> None:
+        """Мгновенный разовый перевод сохранённой области чата по хоткею (F8 / Ctrl+F8) или кнопке."""
         region: ChatRegion = self.settings.chat_region
         if not region.valid:
-            return
-        if not self.settings.ocr_enabled or self.settings.ocr_paused:
+            self.window.set_status("Сначала задайте область чата (Ctrl+Shift+F8)")
+            if self.settings.overlay_over_game:
+                self.chat_overlay.show_message("⚠️ Сначала задайте область чата (Ctrl+Shift+F8)")
             return
         monitors = self.capturer.monitors()
         if not (1 <= region.monitor < len(monitors)):
@@ -796,31 +214,11 @@ class DotaCompanionApplication(QObject):
         }
         try:
             image = self.capturer.grab(bbox)
-        except Exception:
+        except Exception as exc:
+            log.warning("Не удалось захватить область чата: %s", exc)
             return
-        self.engine.submit(image)
 
-    def _set_ocr_active(self, active: bool) -> None:
-        self.settings.ocr_enabled = active
-        paused = not (active and not self.settings.ocr_paused)
-        self.engine.set_paused(paused)
-        if active and not self.settings.ocr_paused:
-            self._ocr_timer.start()
-        else:
-            self._ocr_timer.stop()
-        self.chat_tab.set_ocr_active(active)
-
-    def _on_pause_hotkey(self) -> None:
-        self.chat_tab.toggle_pause()
-        self._sync_ocr_from_settings()
-
-    def _sync_ocr_from_settings(self) -> None:
-        paused = not (self.settings.ocr_enabled and not self.settings.ocr_paused)
-        self.engine.set_paused(paused)
-        if self.settings.ocr_enabled and not self.settings.ocr_paused:
-            self._ocr_timer.start()
-        else:
-            self._ocr_timer.stop()
+        self._on_crop_area_captured(image, region.monitor, bbox)
 
     def _on_ocr_text(self, text: str) -> None:
         if not text or text == self._last_ocr_text:
@@ -829,15 +227,6 @@ class DotaCompanionApplication(QObject):
         self.chat_tab.add_message("OCR", text)
         if self.settings.quick_translation:
             self._translate_and_show("OCR", text)
-
-    def _on_log_chat(self, channel: str, name: str, text: str) -> None:
-        line = f"{name}: {text}"
-        self.chat_tab.add_message("ЛОГ", line)
-        if self.settings.quick_translation:
-            self._translate_and_show("ЛОГ", line)
-        # Попытка привязать игрока по нику из чата
-        if self.match_state.players:
-            self._on_log_chat_roster(channel, name, text)
 
     def _translate_and_show(self, source: str, text: str) -> None:
         self._submit(
@@ -856,21 +245,130 @@ class DotaCompanionApplication(QObject):
                 self._last_notify_ts = now
                 self.window.show_tray_message("Dota Companion · чат", translated[:120])
 
+    def _close_crop_overlays(self) -> None:
+        overlays = list(self.crop_overlays)
+        self.crop_overlays.clear()
+        for ov in overlays:
+            try:
+                ov.blockSignals(True)
+                ov.close()
+            except (RuntimeError, ReferenceError, Exception):
+                pass
+
     def open_crop_overlay(self) -> None:
-        if self.crop_overlay is not None:
+        if self.crop_overlays:
             return
         screens = self.qapp.screens()
-        cursor = QCursor.pos()
-        screen = next((s for s in screens if s.geometry().contains(cursor)), self.qapp.primaryScreen())
-        monitor_index = screens.index(screen) + 1
+        if not screens:
+            return
 
-        self.crop_overlay = CropOverlay(screen, monitor_index)
-        self.crop_overlay.region_selected.connect(self._on_region_selected)
-        self.crop_overlay.cancelled.connect(self._on_crop_cancelled)
-        self.crop_overlay.destroyed.connect(self._on_crop_destroyed)
-        self.crop_overlay.show()
-        self.crop_overlay.raise_()
-        self.crop_overlay.activateWindow()
+        cursor = QCursor.pos()
+        active_screen = next((s for s in screens if s.geometry().contains(cursor)), self.qapp.primaryScreen())
+        monitors = self.capturer.monitors()
+
+        for s_idx, screen in enumerate(screens):
+            sg = screen.geometry()
+            matched_idx = 0
+            for idx, mon in enumerate(monitors[1:], start=1):
+                if mon.get("left") == sg.x() and mon.get("top") == sg.y():
+                    matched_idx = idx
+                    break
+            if matched_idx == 0:
+                matched_idx = min(s_idx + 1, len(monitors) - 1) if len(monitors) > 1 else 1
+
+            screenshot = None
+            pix = None
+            # 1. Надежный прямой захват экрана через QScreen (DWM, без ошибок GDI BitBlt)
+            try:
+                pix = screen.grabWindow(0)
+                if not pix.isNull():
+                    qimg = pix.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+                    w, h = qimg.width(), qimg.height()
+                    ptr = qimg.bits()
+                    ptr.setsize(h * w * 4)
+                    screenshot = Image.frombuffer("RGBA", (w, h), bytes(ptr), "raw", "RGBA", 0, 1).convert("RGB")
+            except Exception as exc:
+                log.warning("Не удалось сделать скриншот через QScreen для экрана %s: %s", screen.name(), exc)
+
+            # 2. Резервный захват через ScreenCapturer (mss)
+            if screenshot is None and 1 <= matched_idx < len(monitors):
+                try:
+                    screenshot = self.capturer.grab(monitors[matched_idx])
+                except Exception as e:
+                    log.warning("Не удалось сделать скриншот для монитора %s: %s", matched_idx, e)
+
+            overlay = CropOverlay(screen, matched_idx, screenshot, pixmap=pix)
+            overlay.area_captured.connect(self._on_crop_area_captured)
+            overlay.region_selected.connect(self._on_region_selected)
+            overlay.cancelled.connect(self._on_crop_cancelled)
+            overlay.destroyed.connect(self._on_crop_destroyed)
+
+            self.crop_overlays.append(overlay)
+            overlay.show()
+            overlay.raise_()
+            if screen == active_screen:
+                overlay.activateWindow()
+
+    def _on_crop_area_captured(self, image, monitor_index: int, bbox: dict) -> None:
+        self._close_crop_overlays()
+        log.info("Захвачена область для перевода: размер %s, bbox=%s", getattr(image, "size", "?"), bbox)
+        self.window.set_status("Распознавание и перевод выделенной области...")
+
+        async def do_crop_and_translate():
+            # If provider supports direct Vision translation and user has enabled it
+            if self.settings.use_vision_for_crop and self.translator.supports_vision():
+                try:
+                    orig, trans = await self.translator.translate_image(
+                        image, target_lang=self.settings.target_lang
+                    )
+                    if trans:
+                        log.info("Vision перевод успешен: %r -> %r", orig, trans)
+                        return ("Vision", orig, trans)
+                except Exception as exc:
+                    log.warning("Vision перевод не удался (%s), переключаемся на стандартный OCR", exc)
+
+            # Fallback to local OCR + Translator
+            loop = asyncio.get_running_loop()
+            text = await loop.run_in_executor(None, self.engine.recognize_image, image)
+            log.info("OCR распознал текст: %r", text)
+            if not text:
+                return ("Выделение", "", "")
+            if self.settings.translator_provider == "gemini" and self.settings.gemini_api_key:
+                try:
+                    translated = await self.translator.translate_gemini(
+                        text, target_lang=self.settings.target_lang
+                    )
+                except Exception as exc:
+                    log.warning("Gemini перевод не удался (%s) — fallback на провайдера", exc)
+                    translated = await self.translator.translate(text)
+            else:
+                try:
+                    translated = await self.translator.translate(text)
+                except Exception as exc:
+                    log.warning("Перевод через %s не удался (%s) — fallback на Google Translate", self.settings.translator_provider, exc)
+                    session = await self.translator._ensure_session()
+                    translated = await self.translator._translate_google(
+                        session, text, "auto", self.settings.target_lang
+                    )
+            return ("Выделение", text, translated)
+
+        def on_done(ok: bool, result):
+            if not ok:
+                log.error("Ошибка при переводе выделенной области: %s", result)
+                self.window.set_status(f"Ошибка перевода: {result}")
+                return
+            source_tag, text, translated = result
+            if not text and not translated:
+                log.warning("Текст в выделенной области не обнаружен (размер: %s)", getattr(image, "size", "?"))
+                self.window.set_status("В выделенной области текст не обнаружен")
+                if self.settings.overlay_over_game:
+                    self.chat_overlay.show_message("⚠️ Текст не обнаружен")
+                return
+
+            self._on_translated(source_tag, text, translated)
+            self.window.set_status(f"Переведено: {translated[:80]}")
+
+        self._submit("area-translate", do_crop_and_translate(), on_done)
 
     def _on_region_selected(self, monitor_index: int, bbox: dict) -> None:
         self.settings.chat_region = ChatRegion(
@@ -882,15 +380,20 @@ class DotaCompanionApplication(QObject):
         )
         self.chat_tab.refresh_region_label()
         self._schedule_save()
-        self.window.set_status(
-            f"Область чата: {bbox['width']}×{bbox['height']} на мониторе {monitor_index}"
-        )
 
     def _on_crop_cancelled(self) -> None:
+        self._close_crop_overlays()
         self.window.set_status("Выбор области отменён")
 
     def _on_crop_destroyed(self) -> None:
-        self.crop_overlay = None
+        cleaned = []
+        for ov in self.crop_overlays:
+            try:
+                _ = ov.isVisible()
+                cleaned.append(ov)
+            except (RuntimeError, ReferenceError):
+                pass
+        self.crop_overlays = cleaned
 
     def _reload_triggers(self) -> None:
         sound_dir = self.settings.sound_dir or str(get_data_dir() / "sounds")
@@ -898,14 +401,29 @@ class DotaCompanionApplication(QObject):
         if not self.settings.sound_dir:
             self.settings.sound_dir = sound_dir
         current = self.settings.sound_triggers or default_triggers()
-        self.settings.sound_triggers = autofill_triggers(current, sound_dir)
+        self.settings.sound_triggers = autofill_triggers(
+            current, sound_dir, ignored_sounds=getattr(self.settings, "ignored_sounds", [])
+        )
         self.soundpad_tab.set_triggers(self.settings.sound_triggers)
         self.soundpad_overlay.set_triggers(self.settings.sound_triggers)
+        self._schedule_save()
+        # Фоновая предзагрузка звуков в память для мгновенного первого воспроизведения
+        valid_paths = [t.path for t in self.settings.sound_triggers if t.available and t.path]
+        if valid_paths:
+            self.audio.preload(valid_paths)
+
+    def _on_overlay_triggers_changed(self) -> None:
+        """Синхронизация при скрытии/удалении звука прямо из плавающего оверлея."""
+        self.soundpad_tab.set_triggers(self.settings.sound_triggers)
         self._schedule_save()
 
     def _on_overlay_volume(self, volume: float) -> None:
         self.settings.master_volume = volume
         self.audio.set_volumes(volume, self.settings.voice_volume)
+        self._schedule_save()
+
+    def _on_overlay_scale(self, scale: float) -> None:
+        self.settings.soundpad_overlay_scale = scale
         self._schedule_save()
 
     def _show_soundpad_overlay(self) -> None:
@@ -926,29 +444,32 @@ class DotaCompanionApplication(QObject):
 
     def _on_settings_changed(self) -> None:
         s = self.settings
-        self.market.update_config(
-            token=s.market_token,
-            currency=s.market_currency,
-            app_id=s.market_app_id,
-            ignore_cache=s.market_ignore_cache,
-            min_interval=s.market_min_interval,
-        )
         self.translator.update(
-            s.translator_provider,
-            s.deepl_api_key,
-            s.libretranslate_url,
-            s.source_lang,
-            s.target_lang,
-            s.gemini_api_key,
-            s.gemini_model,
+            provider=s.translator_provider,
+            deepl_api_key=s.deepl_api_key,
+            libretranslate_url=s.libretranslate_url,
+            source_lang=s.source_lang,
+            target_lang=s.target_lang,
+            gemini_api_key=s.gemini_api_key,
+            gemini_model=s.gemini_model,
+            custom_api_url=s.custom_api_url,
+            custom_api_key=s.custom_api_key,
+            custom_model=s.custom_model,
+            groq_api_key=s.groq_api_key,
+            groq_model=s.groq_model,
+            openrouter_api_key=s.openrouter_api_key,
+            openrouter_model=s.openrouter_model,
+            deepseek_api_key=s.deepseek_api_key,
+            deepseek_model=s.deepseek_model,
+            slang_enhancement=s.slang_enhancement,
         )
         self.audio.set_volumes(s.master_volume, s.voice_volume)
         self.audio.set_device(s.audio_device)
+        self.audio.set_monitor_enabled(getattr(s, "soundpad_monitor", True))
         self.engine.set_lang(s.ocr_lang)
-        self._ocr_timer.setInterval(s.ocr_interval_ms)
         self.chat_overlay.apply_settings()
-        self.translator_tab.set_provider_info(s.translator_provider, s.gemini_model)
-        self._sync_ocr_from_settings()
+        self.soundpad_overlay.set_triggers(s.sound_triggers)
+        self.translator_tab.set_provider_info(s.translator_provider, self._get_active_model_name())
         if not s.overlay_over_game:
             self.chat_overlay.hide()
         self._schedule_save()
@@ -976,32 +497,7 @@ class DotaCompanionApplication(QObject):
         log.error("Задача %s упала: %s", name, error)
         self.window.set_status(f"Ошибка: {error}")
 
-    def _console_log_path(self) -> str:
-        if self.settings.console_log_path and Path(self.settings.console_log_path).is_file():
-            return self.settings.console_log_path
-
-        candidates = []
-        rel_path = "steamapps/common/dota 2 beta/game/dota/console.log"
-        drives = ("C", "D", "E", "F", "G")
-        folders = (
-            "Program Files (x86)/Steam",
-            "Program Files/Steam",
-            "Steam",
-            "SteamLibrary",
-            "Games/Steam",
-            "Games/SteamLibrary",
-        )
-        for drive in drives:
-            for folder in folders:
-                candidates.append(Path(f"{drive}:/{folder}/{rel_path}"))
-
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-        return ""
-
     def _submit(self, name: str, coro, on_done) -> None:
-
         async def runner():
             try:
                 return (True, await coro)
@@ -1015,7 +511,6 @@ class DotaCompanionApplication(QObject):
         self.worker.submit(name, runner(), lambda res: bridge.done.emit(res))
 
     def _deliver_bridge(self, bridge: _ResultBridge, on_done, result: tuple) -> None:
-
         self._bridges.discard(bridge)
         try:
             on_done(*result)

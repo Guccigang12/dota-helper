@@ -18,14 +18,17 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
 
+VK_T = 0x54
 VK_F8 = 0x77
 VK_F9 = 0x78
 VK_F10 = 0x79
 WM_HOTKEY = 0x0312
 
-HOTKEY_CALIBRATE = 1                  
-HOTKEY_PAUSE = 2           
-HOTKEY_EXIT = 3             
+HOTKEY_CALIBRATE = 1
+HOTKEY_CALIBRATE_ALT = 4
+HOTKEY_TRANSLATE_CHAT = 2
+HOTKEY_TRANSLATE_CHAT_CTRL = 5
+HOTKEY_EXIT = 3
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -55,10 +58,8 @@ _user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.W
 
 
 class HotkeyManager(QObject):
-                                                                              
-
     calibrate_region = pyqtSignal()
-    toggle_pause = pyqtSignal()
+    translate_chat = pyqtSignal()
     exit_app = pyqtSignal()
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -67,8 +68,6 @@ class HotkeyManager(QObject):
         self._thread_id: int | None = None
         self._stop_event = threading.Event()
         self._registered: dict[int, tuple[int, int]] = {}
-
-                                                                          
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -81,12 +80,9 @@ class HotkeyManager(QObject):
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread_id is not None:
-                                                             
             _user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         if self._thread:
             self._thread.join(timeout=2.0)
-
-                                                                          
 
     def _register(self, hotkey_id: int, modifiers: int, vk: int) -> bool:
         ok = bool(_user32.RegisterHotKey(None, hotkey_id, modifiers, vk))
@@ -100,11 +96,11 @@ class HotkeyManager(QObject):
         self._registered.clear()
 
     def _run(self) -> None:
-                                                                           
-                                                                             
         bindings = [
+            (HOTKEY_TRANSLATE_CHAT, MOD_NOREPEAT, VK_F8, "F8"),
+            (HOTKEY_TRANSLATE_CHAT_CTRL, MOD_CONTROL | MOD_NOREPEAT, VK_F8, "Ctrl+F8"),
             (HOTKEY_CALIBRATE, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F8, "Ctrl+Shift+F8"),
-            (HOTKEY_PAUSE, 0, VK_F9, "F9"),
+            (HOTKEY_CALIBRATE_ALT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_T, "Ctrl+Shift+T"),
             (HOTKEY_EXIT, 0, VK_F10, "F10"),
         ]
         for hotkey_id, mods, vk, label in bindings:
@@ -124,9 +120,9 @@ class HotkeyManager(QObject):
         self._unregister_all()
 
     def _dispatch(self, hotkey_id: int) -> None:
-        if hotkey_id == HOTKEY_CALIBRATE:
+        if hotkey_id in (HOTKEY_CALIBRATE, HOTKEY_CALIBRATE_ALT):
             self.calibrate_region.emit()
-        elif hotkey_id == HOTKEY_PAUSE:
-            self.toggle_pause.emit()
+        elif hotkey_id in (HOTKEY_TRANSLATE_CHAT, HOTKEY_TRANSLATE_CHAT_CTRL):
+            self.translate_chat.emit()
         elif hotkey_id == HOTKEY_EXIT:
             self.exit_app.emit()

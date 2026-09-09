@@ -1,5 +1,3 @@
-
-   
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -37,9 +35,7 @@ AUTO_DELAY_MS = 900
 
 
 class TranslatorTab(QWidget):
-                                             
-
-    translate_requested = pyqtSignal(str, str, str)                                 
+    translate_requested = pyqtSignal(str, str, str)
     settings_changed = pyqtSignal()
 
     def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
@@ -51,7 +47,6 @@ class TranslatorTab(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-                                   
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
 
@@ -91,13 +86,12 @@ class TranslatorTab(QWidget):
         toolbar.addWidget(self._translate_btn)
         root.addLayout(toolbar)
 
-                            
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
 
-        input_card = Card("✍️ Твой текст")
+        input_card = Card("✍️ Твой текст (Dota 2 сленг / чат)")
         self._input_edit = QPlainTextEdit()
-        self._input_edit.setPlaceholderText("Введи текст — перевод появится справа…")
+        self._input_edit.setPlaceholderText("Введи текст или сленг (например: nmsl, mid diff, 白给, ctm, bb)...")
         self._input_edit.setMinimumHeight(300)
         input_card.content_layout().addWidget(self._input_edit)
         splitter.addWidget(input_card)
@@ -112,7 +106,6 @@ class TranslatorTab(QWidget):
         splitter.setSizes([500, 500])
         root.addWidget(splitter, 1)
 
-                               
         bottom = QHBoxLayout()
         self._copy_btn = GhostButton("📋 Копировать перевод")
         self._copy_btn.clicked.connect(self._copy_result)
@@ -122,20 +115,30 @@ class TranslatorTab(QWidget):
         bottom.addWidget(self._provider_label)
         root.addLayout(bottom)
 
-                                          
         self._auto_timer = QTimer(self)
         self._auto_timer.setSingleShot(True)
         self._auto_timer.setInterval(AUTO_DELAY_MS)
         self._auto_timer.timeout.connect(self.request_translation)
         self._input_edit.textChanged.connect(self._on_text_changed)
 
-                                         
         shortcut = QShortcut(QKeySequence("Ctrl+Return"), self._input_edit)
         shortcut.activated.connect(self.request_translation)
 
-        self.set_provider_info("gemini", self._settings.gemini_model)
+        self.set_provider_info(self._settings.translator_provider, self._get_active_model_name())
 
-                                                                          
+    def _get_active_model_name(self) -> str:
+        p = self._settings.translator_provider
+        if p == "ollama":
+            return self._settings.custom_model
+        elif p == "groq":
+            return self._settings.groq_model
+        elif p == "openrouter":
+            return self._settings.openrouter_model
+        elif p == "deepseek":
+            return self._settings.deepseek_model
+        elif p == "gemini":
+            return self._settings.gemini_model
+        return ""
 
     def _on_text_changed(self) -> None:
         if self._auto_check.isChecked():
@@ -145,8 +148,6 @@ class TranslatorTab(QWidget):
         self._settings.manual_source_lang = self._source_combo.currentData()
         self._settings.manual_target_lang = self._target_combo.currentData()
         self.settings_changed.emit()
-
-                                                                          
 
     def request_translation(self) -> None:
         text = self._input_edit.toPlainText().strip()
@@ -173,14 +174,20 @@ class TranslatorTab(QWidget):
 
     def set_provider_info(self, provider: str, model: str = "") -> None:
         names = {
-            "gemini": "Gemini API",
-            "google": "Google",
+            "ollama": "Ollama (Локальный LLM)",
+            "groq": "Groq API",
+            "openrouter": "OpenRouter API",
+            "deepseek": "DeepSeek API",
+            "gemini": "Gemini 2.0 API",
+            "google": "Google Translate + Dota Slang",
             "deepl": "DeepL",
             "libretranslate": "LibreTranslate",
         }
         text = f"Провайдер: {names.get(provider, provider)}"
-        if provider == "gemini" and model:
+        if model:
             text += f" · модель {model}"
+        if self._settings.slang_enhancement:
+            text += " · [Сленг-фильтр ВКЛ]"
         self._provider_label.setText(text)
 
     def _copy_result(self) -> None:

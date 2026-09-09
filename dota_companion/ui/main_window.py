@@ -1,13 +1,15 @@
-                                                                   
 from __future__ import annotations
 
 from PyQt6.QtCore import QSettings, pyqtSignal
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
+    QLabel,
     QMainWindow,
     QMenu,
     QSystemTrayIcon,
     QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
 
 from ..core.settings import Settings
@@ -15,17 +17,14 @@ from .theme import app_icon
 
 
 class MainWindow(QMainWindow):
-                                  
-
     quit_requested = pyqtSignal()
-    pause_toggled = pyqtSignal()
+    translate_chat_requested = pyqtSignal()
     crop_requested = pyqtSignal()
     soundpad_overlay_toggled = pyqtSignal(bool)
 
     def __init__(
         self,
         settings: Settings,
-        match_tab,
         chat_tab,
         translator_tab,
         soundpad_tab,
@@ -33,27 +32,40 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self._settings = settings
+        self._chat_tab = chat_tab
+        self._translator_tab = translator_tab
+        self._soundpad_tab = soundpad_tab
+        self._status_label: QLabel | None = None
+        self._tray: QSystemTrayIcon | None = None
         self._quitting = False
 
-        self.setWindowTitle("Dota Companion")
-        self.setMinimumSize(1000, 660)
-        self.resize(1180, 760)
-
-        tabs = QTabWidget()
-        tabs.addTab(match_tab, "⚔️ Матч")
-        tabs.addTab(chat_tab, "💬 Чат-переводчик")
-        tabs.addTab(translator_tab, "🌐 Переводчик")
-        tabs.addTab(soundpad_tab, "🎵 Саундпад")
-        self.setCentralWidget(tabs)
-
-        self.statusBar().showMessage("Готово")
-
-        self._init_tray()
+        self._build_ui()
+        self._build_tray()
         self._restore_geometry()
 
-                                                                          
+    def _build_ui(self) -> None:
+        self.setWindowTitle("Dota Companion")
+        self.setMinimumSize(950, 620)
+        self.resize(1100, 720)
 
-    def _init_tray(self) -> None:
+        tabs = QTabWidget()
+        tabs.addTab(self._chat_tab, "💬 Чат-переводчик")
+        tabs.addTab(self._translator_tab, "🌐 Переводчик")
+        tabs.addTab(self._soundpad_tab, "🎵 Саундпад")
+        
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.addWidget(tabs)
+        
+        self._status_label = QLabel("Готово")
+        layout.addWidget(self._status_label)
+        
+        self.setCentralWidget(container)
+
+    def _build_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
         self._tray = QSystemTrayIcon(app_icon(), self)
         self._tray.setToolTip("Dota Companion")
 
@@ -64,16 +76,16 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
+        translate_action = menu.addAction("Перевести чат (F8)")
+        translate_action.triggered.connect(self.translate_chat_requested.emit)
+
+        crop_action = menu.addAction("Выделить и перевести область (Ctrl+Shift+F8)")
+        crop_action.triggered.connect(self.crop_requested.emit)
+
         self._soundpad_overlay_action = menu.addAction("Саундпад-оверлей")
         self._soundpad_overlay_action.setCheckable(True)
         self._soundpad_overlay_action.setChecked(self._settings.soundpad_overlay_visible)
         self._soundpad_overlay_action.triggered.connect(self.soundpad_overlay_toggled.emit)
-
-        self._pause_action = menu.addAction("Пауза OCR (F9)")
-        self._pause_action.triggered.connect(self.pause_toggled.emit)
-
-        crop_action = menu.addAction("Выбрать область чата (Ctrl+Shift+F8)")
-        crop_action.triggered.connect(self.crop_requested.emit)
 
         menu.addSeparator()
 
@@ -87,8 +99,6 @@ class MainWindow(QMainWindow):
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.toggle_visibility()
-
-                                                                          
 
     def toggle_visibility(self) -> None:
         if self.isVisible():
@@ -110,9 +120,7 @@ class MainWindow(QMainWindow):
         self._soundpad_overlay_action.setChecked(checked)
         self._soundpad_overlay_action.blockSignals(False)
 
-                                                                          
-
-    def closeEvent(self, event: QCloseEvent) -> None:              
+    def closeEvent(self, event: QCloseEvent) -> None:
         if self._quitting:
             self._save_geometry()
             event.accept()
@@ -130,8 +138,6 @@ class MainWindow(QMainWindow):
         self._quitting = True
         self._save_geometry()
         self.close()
-
-                                                                          
 
     def _restore_geometry(self) -> None:
         qsettings = QSettings("DotaCompanion", "DotaCompanion")

@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -31,9 +30,7 @@ def get_data_dir() -> Path:
 
 @dataclass
 class ChatRegion:
-                                                                     
-
-    monitor: int = 1                                             
+    monitor: int = 1
     x: int = 0
     y: int = 0
     width: int = 0
@@ -46,10 +43,9 @@ class ChatRegion:
 
 @dataclass
 class SoundTrigger:
-                                                                 
-
     label: str = ""
     path: str = ""
+    in_overlay: bool = True
 
     @property
     def available(self) -> bool:
@@ -58,62 +54,65 @@ class SoundTrigger:
 
 @dataclass
 class Settings:
-                             
-    market_token: str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzUxMiJ9.eyJzdWIiOjEwODY1MjQ4LCJpc3MiOiJsenQiLCJpYXQiOjE3ODY5OTE2NDYsImp0aSI6IjEwMDY0NTYiLCJzY29wZSI6ImJhc2ljIHJlYWQgcG9zdCBjb252ZXJzYXRlIHBheW1lbnQgaW52b2ljZSBjaGF0Ym94IG1hcmtldCIsImV4cCI6MTk0NDY3MTY0Nn0.AluJS9sdL1ReFQwkPTkORrxBJzOLaGPSLW8zob4Y03v-KPQiXFYsB5iElnhkQDo8lgJlIyYqWffgbI-4a5gWXnGhOoiODRp7Y6nnQc-55ICyJ_CPyo227y2tVH_o4Qyxe8ANYv4XSpEE-Ecf82pQzNTf6jNF4_xK44DLrJVVN_Q"
-    market_currency: str = "usd"                                                   
-    market_app_id: int = 570                      
-    market_ignore_cache: bool = False
-    market_min_interval: float = 0.8                                           
-
-                    
-    gsi_port: int = 34567
-    gsi_auth_token: str = ""
-    steam_api_key: str = ""
-    console_log_path: str = ""                                     
-
-                 
+    # OCR / Распознавание чата
     ocr_enabled: bool = False
     ocr_paused: bool = False
     ocr_interval_ms: int = 800
-    ocr_lang: str = "ch"                                   
+    ocr_lang: str = "all"
     chat_region: ChatRegion = field(default_factory=ChatRegion)
 
-                     
-    translator_provider: str = "gemini"                                             
+    # Переводчик (общие настройки)
+    translator_provider: str = "gemini"
     deepl_api_key: str = ""
     libretranslate_url: str = "https://libretranslate.com/translate"
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_model: str = "gemini-2.0-flash"
     source_lang: str = "auto"
     target_lang: str = "ru"
 
-                                                      
+    # Неограниченные / LLM провайдеры
+    custom_api_url: str = "http://localhost:11434/v1"
+    custom_api_key: str = ""
+    custom_model: str = "qwen2.5:7b"
+
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+
+    openrouter_api_key: str = ""
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-chat"
+
+    # Сленг и мультимодальный перевод по фото
+    use_vision_for_crop: bool = True
+    slang_enhancement: bool = True
+
+    # Ручной переводчик
     manual_source_lang: str = "auto"
     manual_target_lang: str = "en"
 
-                           
+    # Оверлей чата и уведомления
     quick_translation: bool = True
     overlay_over_game: bool = False
     notifications_enabled: bool = False
     font_size: int = 14
     showtime_ms: int = 6000
 
-                      
-    sound_dir: str = ""                                              
-    audio_device: str = ""                                                                               
+    # Саундпад
+    sound_dir: str = ""
+    audio_device: str = ""
     master_volume: float = 0.8
     voice_volume: float = 1.0
+    soundpad_monitor: bool = True  # Дублировать звук в системные наушники при использовании VAC
     sound_triggers: list[SoundTrigger] = field(default_factory=list)
+    ignored_sounds: list[str] = field(default_factory=list)  # Список скрытых/удаленных звуков
 
-                                                                 
-                                                                
-    account_mappings: dict[str, str] = field(default_factory=dict)
-
-                    
+    # Оверлеи
     soundpad_overlay_visible: bool = False
-    chat_overlay_geometry: list[int] = field(default_factory=lambda: [])                
-
-                                                                          
+    soundpad_overlay_scale: float = 1.0
+    soundpad_overlay_geometry: list[int] = field(default_factory=lambda: [])
+    chat_overlay_geometry: list[int] = field(default_factory=lambda: [])
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -129,14 +128,16 @@ class Settings:
                 s.chat_region = ChatRegion(**{k: v for k, v in value.items() if k in ChatRegion.__dataclass_fields__})
             elif f.name == "sound_triggers" and isinstance(value, list):
                 s.sound_triggers = [
-                    SoundTrigger(label=str(t.get("label", "")), path=str(t.get("path", "")))
+                    SoundTrigger(
+                        label=str(t.get("label", "")),
+                        path=str(t.get("path", "")),
+                        in_overlay=bool(t.get("in_overlay", True)),
+                    )
                     for t in value if isinstance(t, dict)
                 ]
             else:
                 setattr(s, f.name, value)
         return s
-
-                                                                          
 
     def load(self, path: Path | None = None) -> None:
         path = path or get_config_dir() / SETTINGS_FILE
@@ -150,7 +151,7 @@ class Settings:
         try:
             loaded = self.from_dict(data)
             self.__dict__.update(loaded.__dict__)
-        except Exception as exc:                                                        
+        except Exception as exc:
             log.warning("Ошибка применения настроек из %s: %s", path, exc)
 
     def save(self, path: Path | None = None) -> None:

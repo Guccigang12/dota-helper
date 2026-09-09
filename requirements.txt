@@ -8,15 +8,15 @@ numpy>=1.26
 # === Звук (SoundPad) ===
 sounddevice>=0.4.6
 soundfile>=0.12.1      # WAV / FLAC / OGG
-imageio-ffmpeg>=0.4.7  # MP3 (эталонный декодер ffmpeg, как у Windows Player)
+imageio-ffmpeg>=0.4.7  # MP3 (декодер ffmpeg)
 miniaudio>=1.59        # MP3 (fallback)
 
-# === OCR: вариант A — PaddleOCR (китайский/английский/испанский) ===
-# Тяжёлый, но лучший для игрового чата. Устанавливается отдельно:
-#   pip install paddlepaddle paddleocr
-# Если не установлен — автоматический fallback на Tesseract (вариант B).
+# === OCR: движок №1 — Windows OCR (встроен в Windows 10/11, рекомендуются) ===
+winocr>=0.0.15
 
-# === OCR: вариант B — Tesseract (fallback) ===
-# Нужен сам Tesseract 5 в системе: https://github.com/UB-Mannheim/tesseract/wiki
-# + языковые пакеты chi_sim, eng, spa (в папку tessdata)
+# === OCR: вариант B — PaddleOCR (китайский/английский/испанский) ===
+# Устанавливается отдельно при необходимости:
+#   pip install paddlepaddle paddleocr
+
+# === OCR: вариант C — Tesseract (fallback) ===
 pytesseract>=0.3.10
