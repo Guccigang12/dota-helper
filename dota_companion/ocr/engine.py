@@ -122,20 +122,22 @@ class OcrEngine(QThread):
         self._tesseract_installed_langs: set[str] = set()
         self._active_backend = ""
         self._backend_announced = False
+        self._lock = threading.RLock()
 
     # === Public API ===
 
     def set_lang(self, lang: str) -> None:
-        if lang == self._lang:
-            return
-        self._lang = lang if lang in TESS_LANGS else "ch"
-        # Re-resolve Windows OCR language pack for the new language
-        self._winocr_available = None
-        self._winocr_lang_tag = None
-        self._winocr_lang_warning = None
-        self._winocr_lang_missing = False
-        self._paddle = None
-        self._backend_announced = False
+        with self._lock:
+            if lang == self._lang:
+                return
+            self._lang = lang if lang in TESS_LANGS else "ch"
+            # Re-resolve Windows OCR language pack for the new language
+            self._winocr_available = None
+            self._winocr_lang_tag = None
+            self._winocr_lang_warning = None
+            self._winocr_lang_missing = False
+            self._paddle = None
+            self._backend_announced = False
 
     def set_paused(self, paused: bool) -> None:
         if paused:
@@ -188,16 +190,17 @@ class OcrEngine(QThread):
                 self.signals.text_ready.emit(text)
 
     def recognize_image(self, image: Image.Image) -> str:
-        # 1. Сначала пробуем распознать исходное изображение без искажений масштабирования
-        raw_text = self._recognize(image)
-        cleaned = self._clean(raw_text)
-        if cleaned:
-            return cleaned
+        with self._lock:
+            # 1. Сначала пробуем распознать исходное изображение без искажений масштабирования
+            raw_text = self._recognize(image)
+            cleaned = self._clean(raw_text)
+            if cleaned:
+                return cleaned
 
-        # 2. Если не распознано — применяем масштабирование и повышение контраста
-        processed = self._preprocess(image)
-        raw_text = self._recognize(processed)
-        return self._clean(raw_text)
+            # 2. Если не распознано — применяем масштабирование и повышение контраста
+            processed = self._preprocess(image)
+            raw_text = self._recognize(processed)
+            return self._clean(raw_text)
 
     # === Preprocessing ===
 

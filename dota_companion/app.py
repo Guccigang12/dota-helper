@@ -322,7 +322,7 @@ class DotaCompanionApplication(QObject):
                         image, target_lang=self.settings.target_lang
                     )
                     if trans:
-                        log.info("Vision перевод успешен: %r -> %r", orig, trans)
+                        log.debug("Vision перевод успешен: %r -> %r", orig, trans)
                         return ("Vision", orig, trans)
                 except Exception as exc:
                     log.warning("Vision перевод не удался (%s), переключаемся на стандартный OCR", exc)
@@ -330,26 +330,15 @@ class DotaCompanionApplication(QObject):
             # Fallback to local OCR + Translator
             loop = asyncio.get_running_loop()
             text = await loop.run_in_executor(None, self.engine.recognize_image, image)
-            log.info("OCR распознал текст: %r", text)
+            log.debug("OCR распознал текст: %r", text)
             if not text:
                 return ("Выделение", "", "")
-            if self.settings.translator_provider == "gemini" and self.settings.gemini_api_key:
-                try:
-                    translated = await self.translator.translate_gemini(
-                        text, target_lang=self.settings.target_lang
-                    )
-                except Exception as exc:
-                    log.warning("Gemini перевод не удался (%s) — fallback на провайдера", exc)
-                    translated = await self.translator.translate(text)
-            else:
-                try:
-                    translated = await self.translator.translate(text)
-                except Exception as exc:
-                    log.warning("Перевод через %s не удался (%s) — fallback на Google Translate", self.settings.translator_provider, exc)
-                    session = await self.translator._ensure_session()
-                    translated = await self.translator._translate_google(
-                        session, text, "auto", self.settings.target_lang
-                    )
+
+            translated = await self.translator.translate_with_fallback(
+                text,
+                source_lang=self.settings.source_lang,
+                target_lang=self.settings.target_lang,
+            )
             return ("Выделение", text, translated)
 
         def on_done(ok: bool, result):

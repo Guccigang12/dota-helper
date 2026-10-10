@@ -136,6 +136,19 @@ class Settings:
                     for t in value if isinstance(t, dict)
                 ]
             else:
+                # Type validation and safe conversion
+                target_type = f.type
+                try:
+                    if target_type in (bool, "bool"):
+                        value = bool(value)
+                    elif target_type in (int, "int"):
+                        value = int(value)
+                    elif target_type in (float, "float"):
+                        value = float(value)
+                    elif target_type in (str, "str"):
+                        value = str(value)
+                except (ValueError, TypeError):
+                    continue
                 setattr(s, f.name, value)
         return s
 
@@ -158,6 +171,15 @@ class Settings:
         path = path or get_config_dir() / SETTINGS_FILE
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            import tempfile
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix="settings_", suffix=".tmp")
+            try:
+                with open(tmp_fd, "w", encoding="utf-8") as f:
+                    json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
         except OSError as exc:
             log.warning("Не удалось сохранить настройки в %s: %s", path, exc)

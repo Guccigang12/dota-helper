@@ -11,7 +11,8 @@ from .logger import get_logger
 
 log = get_logger("hotkeys")
 
-                             
+import sys
+
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -30,8 +31,7 @@ HOTKEY_TRANSLATE_CHAT = 2
 HOTKEY_TRANSLATE_CHAT_CTRL = 5
 HOTKEY_EXIT = 3
 
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+WM_QUIT = 0x0012
 
 
 class MSG(ctypes.Structure):
@@ -45,16 +45,20 @@ class MSG(ctypes.Structure):
     ]
 
 
-WM_QUIT = 0x0012
-
-_user32.RegisterHotKey.restype = wintypes.BOOL
-_user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
-_user32.UnregisterHotKey.restype = wintypes.BOOL
-_user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
-_user32.GetMessageW.restype = wintypes.BOOL
-_user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
-_user32.PostThreadMessageW.restype = wintypes.BOOL
-_user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+if sys.platform == "win32":
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _user32.RegisterHotKey.restype = wintypes.BOOL
+    _user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+    _user32.UnregisterHotKey.restype = wintypes.BOOL
+    _user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    _user32.GetMessageW.restype = wintypes.BOOL
+    _user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    _user32.PostThreadMessageW.restype = wintypes.BOOL
+    _user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+else:
+    _user32 = None
+    _kernel32 = None
 
 
 class HotkeyManager(QObject):
@@ -67,41 +71,54 @@ class HotkeyManager(QObject):
         self._thread: threading.Thread | None = None
         self._thread_id: int | None = None
         self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
         self._registered: dict[int, tuple[int, int]] = {}
 
     def start(self) -> None:
+        if sys.platform != "win32" or _user32 is None:
+            log.warning("Глобальные хоткеи поддерживаются только на Windows")
+            return
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._ready_event.clear()
         self._thread = threading.Thread(target=self._run, name="hotkeys", daemon=True)
         self._thread.start()
-        self._thread_id = self._thread.native_id
+        self._ready_event.wait(timeout=1.0)
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._thread_id is not None:
+        if self._thread_id is not None and _user32 is not None:
             _user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         if self._thread:
             self._thread.join(timeout=2.0)
 
     def _register(self, hotkey_id: int, modifiers: int, vk: int) -> bool:
+        if _user32 is None:
+            return False
         ok = bool(_user32.RegisterHotKey(None, hotkey_id, modifiers, vk))
         if ok:
             self._registered[hotkey_id] = (modifiers, vk)
         return ok
 
     def _unregister_all(self) -> None:
-        for hotkey_id in list(self._registered):
-            _user32.UnregisterHotKey(None, hotkey_id)
+        if _user32 is not None:
+            for hotkey_id in list(self._registered):
+                _user32.UnregisterHotKey(None, hotkey_id)
         self._registered.clear()
 
     def _run(self) -> None:
+        if _user32 is None:
+            return
+        self._thread_id = threading.get_native_id()
+        self._ready_event.set()
+
         bindings = [
             (HOTKEY_TRANSLATE_CHAT, MOD_NOREPEAT, VK_F8, "F8"),
             (HOTKEY_TRANSLATE_CHAT_CTRL, MOD_CONTROL | MOD_NOREPEAT, VK_F8, "Ctrl+F8"),
             (HOTKEY_CALIBRATE, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F8, "Ctrl+Shift+F8"),
             (HOTKEY_CALIBRATE_ALT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_T, "Ctrl+Shift+T"),
-            (HOTKEY_EXIT, 0, VK_F10, "F10"),
+            (HOTKEY_EXIT, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, VK_F10, "Ctrl+Shift+F10"),
         ]
         for hotkey_id, mods, vk, label in bindings:
             if self._register(hotkey_id, mods, vk):

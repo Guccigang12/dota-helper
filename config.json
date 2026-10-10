@@ -1,0 +1,49 @@
+{
+  "gsi": {
+    "host": "127.0.0.1",
+    "port": 32123,
+    "auth_token": "DOTAHELPER_GSI_SECRET_KEY"
+  },
+  "openrouter": {
+    "api_key": "",
+    "model": "google/gemini-2.5-flash",
+    "site_url": "https://github.com/dotahelper",
+    "site_name": "DotaHelper"
+  },
+  "pricing": {
+    "currency": "USD",
+    "min_item_price": 1.0,
+    "cache_ttl_hours": 12,
+    "rate_limit_delay": 1.8,
+    "proxy": "",
+    "reverse_proxy_url": ""
+  },
+  "chat_vision": {
+    "roi": {
+      "left": 15,
+      "top": 620,
+      "right": 460,
+      "bottom": 880
+    },
+    "jpeg_quality": 85,
+    "hotkey_translate": "f8",
+    "hotkey_select_roi": "ctrl+shift+f8"
+  },
+  "overlay": {
+    "opacity": 0.96,
+    "always_on_top": true,
+    "x": 60,
+    "y": 60,
+    "width": 540,
+    "height": 760,
+    "hotkey_toggle": "f9"
+  },
+  "soundpad": {
+    "enabled": true,
+    "sounds_dir": "sounds",
+    "audio_device": "",
+    "master_volume": 0.8,
+    "voice_volume": 1.0,
+    "monitor_enabled": true
+  }
+}

@@ -216,7 +216,7 @@ class Translator:
 
             # Default Google Translate (enhanced with Dota 2 slang)
             return await self._translate_google(session, text, source, target)
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise TranslationError(f"Сетевая ошибка перевода: {exc}") from exc
 
     async def translate_gemini(self, text: str, *, target_lang: str | None = None) -> str:
@@ -230,8 +230,46 @@ class Translator:
         session = await self._ensure_session()
         try:
             return await self._translate_gemini(session, text, target)
-        except aiohttp.ClientError as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise TranslationError(f"Сетевая ошибка перевода: {exc}") from exc
+
+    async def translate_google(
+        self,
+        text: str,
+        *,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
+    ) -> str:
+        """Public fallback method to translate using Google Translate."""
+        text = text.strip()
+        if not text:
+            return ""
+        session = await self._ensure_session()
+        try:
+            return await self._translate_google(
+                session,
+                text,
+                source_lang or self.source_lang or "auto",
+                target_lang or self.target_lang or "ru",
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise TranslationError(f"Google Translate: сетевая ошибка: {exc}") from exc
+
+    async def translate_with_fallback(
+        self,
+        text: str,
+        *,
+        source_lang: str | None = None,
+        target_lang: str | None = None,
+    ) -> str:
+        """
+        Translates via configured provider, falling back gracefully to Google Translate.
+        """
+        try:
+            return await self.translate(text, source_lang=source_lang, target_lang=target_lang)
+        except Exception as exc:
+            log.warning("Основной переводчик не сработал (%s), fallback на Google Translate", exc)
+            return await self.translate_google(text, source_lang=source_lang, target_lang=target_lang)
 
     def supports_vision(self) -> bool:
         """Returns True if the current provider can process images directly."""
@@ -255,29 +293,31 @@ class Translator:
         image.convert("RGB").save(buffered, format="JPEG", quality=90)
         img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-        if self.provider == "gemini":
-            return await self._vision_gemini(session, img_b64, target)
-        elif self.provider in ("ollama", "openai_compatible", "openrouter"):
-            base_url = (
-                OPENROUTER_BASE
-                if self.provider == "openrouter"
-                else (self.custom_api_url or OLLAMA_BASE)
-            )
-            model = (
-                self.openrouter_model
-                if self.provider == "openrouter"
-                else (self.custom_model or "qwen2.5-vl")
-            )
-            api_key = (
-                self.openrouter_api_key
-                if self.provider == "openrouter"
-                else self.custom_api_key
-            )
-            return await self._vision_openai_compatible(
-                session, img_b64, target, base_url, model, api_key
-            )
-
-        raise TranslationError(f"Провайдер {self.provider} не поддерживает прямой перевод по фото")
+        try:
+            if self.provider == "gemini":
+                return await self._vision_gemini(session, img_b64, target)
+            elif self.provider in ("ollama", "openai_compatible", "openrouter"):
+                base_url = (
+                    OPENROUTER_BASE
+                    if self.provider == "openrouter"
+                    else (self.custom_api_url or OLLAMA_BASE)
+                )
+                model = (
+                    self.openrouter_model
+                    if self.provider == "openrouter"
+                    else (self.custom_model or "qwen2.5-vl")
+                )
+                api_key = (
+                    self.openrouter_api_key
+                    if self.provider == "openrouter"
+                    else self.custom_api_key
+                )
+                return await self._vision_openai_compatible(
+                    session, img_b64, target, base_url, model, api_key
+                )
+            raise TranslationError(f"Провайдер {self.provider} не поддерживает прямой перевод по фото")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise TranslationError(f"Сетевая ошибка анализа изображения: {exc}") from exc
 
     # === Gemini API ===
 
@@ -289,7 +329,10 @@ class Translator:
 
         model_name = self.gemini_model or DEFAULT_GEMINI_MODEL
         url = f"{GEMINI_BASE}/models/{model_name}:generateContent"
-        params = {"key": self.gemini_api_key}
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.gemini_api_key,
+        }
         payload = {
             "system_instruction": {
                 "parts": [{"text": DOTA_SYSTEM_PROMPT.format(target_lang=target_lang)}]
@@ -303,7 +346,7 @@ class Translator:
 
         last_error: TranslationError | None = None
         for attempt in range(3):
-            async with session.post(url, params=params, json=payload) as resp:
+            async with session.post(url, headers=headers, json=payload) as resp:
                 if resp.status == 200:
                     data = await resp.json(content_type=None)
                     candidates = data.get("candidates") or []
@@ -334,7 +377,10 @@ class Translator:
 
         model_name = self.gemini_model or DEFAULT_GEMINI_MODEL
         url = f"{GEMINI_BASE}/models/{model_name}:generateContent"
-        params = {"key": self.gemini_api_key}
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.gemini_api_key,
+        }
         payload = {
             "contents": [
                 {
@@ -357,18 +403,30 @@ class Translator:
             },
         }
 
-        async with session.post(url, params=params, json=payload) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise TranslationError(f"Gemini Vision -> {resp.status}: {body[:200]}")
-            data = await resp.json(content_type=None)
+        last_error: TranslationError | None = None
+        for attempt in range(3):
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    candidates = data.get("candidates") or []
+                    if not candidates:
+                        raise TranslationError("Gemini Vision вернул пустой ответ")
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    raw = "".join(p.get("text", "") for p in parts).strip()
+                    if not raw:
+                        raise TranslationError("Gemini Vision вернул пустой текст")
+                    return self._parse_vision_response(raw)
 
-        candidates = data.get("candidates") or []
-        if not candidates:
-            raise TranslationError("Gemini Vision вернул пустой ответ")
-        parts = candidates[0].get("content", {}).get("parts", [])
-        raw = "".join(p.get("text", "") for p in parts).strip()
-        return self._parse_vision_response(raw)
+                body = await resp.text()
+                if resp.status in (429, 503):
+                    last_error = TranslationError(f"Gemini Vision -> {resp.status}: {body[:120]}")
+                    log.warning("Gemini Vision временно недоступен (%s), попытка %d", resp.status, attempt + 1)
+                    await asyncio.sleep(1.5 * (attempt + 1))
+                    continue
+
+                raise TranslationError(f"Gemini Vision -> {resp.status}: {body[:200]}")
+
+        raise TranslationError(f"Gemini Vision недоступен: {last_error}")
 
     # === OpenAI-Compatible API (Ollama / Groq / OpenRouter / DeepSeek / LM Studio) ===
 
@@ -417,6 +475,8 @@ class Translator:
         if not choices:
             raise TranslationError(f"{service_name} вернул пустой список ответов")
         content = choices[0].get("message", {}).get("content", "")
+        if not content:
+            raise TranslationError(f"{service_name} вернул пустой текст ответа")
         return content.strip()
 
     async def _vision_openai_compatible(
@@ -469,6 +529,8 @@ class Translator:
         if not choices:
             raise TranslationError("Vision API вернул пустой ответ")
         raw = choices[0].get("message", {}).get("content", "").strip()
+        if not raw:
+            raise TranslationError("Vision API вернул пустой текст")
         return self._parse_vision_response(raw)
 
     @staticmethod

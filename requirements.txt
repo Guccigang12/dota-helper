@@ -1,4 +1,4 @@
-# DotaHelper Dependencies (VAC-Safe Companion)
+# DotaHelper & Dota Companion Dependencies
 PyQt6>=6.7.0
 requests>=2.31.0
 aiohttp>=3.9.0
@@ -8,3 +8,7 @@ vdf>=3.4
 psutil>=5.9.0
 mss>=9.0.0
 PySocks>=1.7.1
+numpy>=1.24.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+pytesseract>=0.3.10

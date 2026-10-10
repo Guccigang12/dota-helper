@@ -1,6 +1,6 @@
-
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import mss
@@ -12,22 +12,27 @@ log = get_logger("capturer")
 
 
 class ScreenCapturer:
-    def __init__(self) -> None:
-        self._sct = mss.mss()
+    """Thread-safe screen capture utility using mss."""
 
-                                                                          
+    def __init__(self) -> None:
+        if hasattr(mss, "MSS"):
+            self._sct = mss.MSS()
+        else:
+            self._sct = mss.mss()
+        self._lock = threading.Lock()
 
     def monitors(self) -> list[dict[str, Any]]:
-                                                                              
-        return self._sct.monitors
+        with self._lock:
+            return list(self._sct.monitors)
 
     def grab(self, bbox: dict[str, int]) -> Image.Image:
-                                                                                                 
-        shot = self._sct.grab(bbox)
-        return Image.frombytes("RGB", shot.size, shot.rgb)
+        with self._lock:
+            shot = self._sct.grab(bbox)
+            return Image.frombytes("RGB", shot.size, shot.rgb)
 
     def close(self) -> None:
-        try:
-            self._sct.close()
-        except Exception:                                             
-            pass
+        with self._lock:
+            try:
+                self._sct.close()
+            except Exception as exc:
+                log.debug("Ошибка при закрытии capturer: %s", exc)

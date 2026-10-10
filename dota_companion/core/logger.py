@@ -1,4 +1,3 @@
-                                                       
 from __future__ import annotations
 
 import logging
@@ -10,7 +9,7 @@ _FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 
 def configure_logging(log_dir: Path | None = None, level: int = logging.INFO) -> logging.Logger:
-                                                                             
+    """Configures console and optional file logging for the application."""
     root = logging.getLogger(_ROOT)
     if root.handlers:
         return root
@@ -40,5 +39,5 @@ def configure_logging(log_dir: Path | None = None, level: int = logging.INFO) ->
 
 
 def get_logger(name: str) -> logging.Logger:
-                                                                
+    """Returns a namespaced child logger."""
     return logging.getLogger(f"{_ROOT}.{name}")

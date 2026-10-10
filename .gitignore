@@ -20,3 +20,6 @@ dist/
 # IDE
 .idea/
 .vscode/
+
+# Local session files
+conversation_history*.jsonl
