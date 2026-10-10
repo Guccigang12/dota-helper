@@ -12,7 +12,7 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -127,7 +127,6 @@ class AudioBackend:
         try:
             import sounddevice as sd
             devices = sd.query_devices()
-            hostapis = sd.query_hostapis()
         except Exception:
             return None
 

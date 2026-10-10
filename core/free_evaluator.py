@@ -11,18 +11,19 @@ Key components:
 2. FreeProxyProvider:
    - Automatically loads live HTTPS proxies from Proxyscrape API:
      https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&ssl=yes
-   - Used when direct Steam Community requests time out due to ISP blocking.
+   - Validates proxy responses (rejects HTML block pages).
 3. Steam Community Inventory Client:
    - Fetches https://steamcommunity.com/inventory/{steam_id}/570/2?l=english&count=2000
-   - Cloudflare Worker reverse-proxy support ({worker_url}/inventory/{steam_id}/570/2?l=english&count=2000).
-   - HTTP/SOCKS5 proxy and auto free proxy fallback.
-   - Statuses: 200 (parse items), 403 or empty (HIDDEN: [Скрыт]), 429 (rate-limit backoff).
+   - Pagination support up to 5 pages via more_items & last_assetid.
+   - Guaranteed official Steam 403 protection (proxy 403 does not pollute cache as HIDDEN).
+   - Cloudflare Worker and HTTP/SOCKS5 proxy support.
 4. Pricing & Filtering:
    - Only counts tradable items (tradable == 1).
-   - Filters out items below min_item_price ($0.5 default; items cheaper than $0.5 are excluded).
+   - Filters out items below min_item_price ($0.5 default).
 5. Queue & Caching:
-   - SQLite cache (inventory_cache.db, 12-hour TTL).
-   - Background worker with 1.5s delay between requests.
+   - SQLite cache with composite cache_key ({steam_id}_{currency}, 12-hour TTL).
+   - Rate limit 429 backoff with max 3 retries.
+   - Clean _in_queue_set synchronization.
    - Streaming on_player_evaluated callback per player.
 """
 
@@ -91,7 +92,6 @@ def normalize_proxy_dict(proxy_str: str) -> Optional[Dict[str, str]]:
     if not proxy_str or not proxy_str.strip():
         return None
     p = proxy_str.strip()
-    # If the user passed a Cloudflare worker URL as proxy, do not treat as forward proxy
     if p.startswith("http://") or p.startswith("https://"):
         if "workers.dev" in p or "/inventory" in p:
             return None
@@ -104,7 +104,7 @@ def normalize_proxy_dict(proxy_str: str) -> Optional[Dict[str, str]]:
 class InventoryValueResult:
     steam_id: str
     value_usd: Optional[float]
-    status: str  # "OK", "HIDDEN", "CACHED", "QUEUED", "ERROR", "NO_TOKEN"
+    status: str  # "OK", "HIDDEN", "CACHED", "QUEUED", "ERROR", "RATE_LIMIT"
     cached: bool = False
     error_message: Optional[str] = None
     updated_at: float = field(default_factory=time.time)
@@ -126,7 +126,7 @@ class InventoryValueResult:
             return "[Скрыт]"
         elif self.status == "QUEUED":
             return "⏳ В очереди..."
-        elif self.status == "ERROR":
+        elif self.status in ("ERROR", "RATE_LIMIT"):
             return "[Ошибка]"
         elif self.status == "NO_TOKEN":
             return "[Без токена]"
@@ -311,12 +311,12 @@ class FreeProxyProvider:
             return list(self._proxies)
 
     def get_next_proxy(self) -> Optional[str]:
+        need_fetch = False
         with self._lock:
             if not self._proxies or (time.time() - self._last_fetched > self.ttl_seconds):
-                # Fetch in locked scope without deadlock
-                pass
+                need_fetch = True
 
-        if not self._proxies or (time.time() - self._last_fetched > self.ttl_seconds):
+        if need_fetch:
             self.fetch_proxies(force=True)
 
         with self._lock:
@@ -335,12 +335,12 @@ class FreeInventoryEvaluator:
     Evaluates player inventories using Market Dota 2 price database and Steam Community API.
     Features:
     - 6-hour prices dump cache (prices_cache.json).
-    - SQLite 12-hour inventory cache (inventory_cache.db).
-    - Queue with 1.5s rate-limiting delay.
+    - SQLite 12-hour inventory cache with currency-composite key (inventory_cache.db).
+    - Steam pagination loop (up to 5 pages) via more_items & last_assetid.
+    - Official Steam 403 validation (proxy 403 errors are not cached as HIDDEN).
+    - Rate limit 429 backoff with max 3 retries.
     - Cloudflare Worker and HTTP/SOCKS5 proxy support.
-    - Automatic free proxy fallback via Proxyscrape API.
     - Tradable items filtering and threshold >= $0.5.
-    - HTTP 403 / empty inventory -> status [Скрыт].
     """
 
     def __init__(
@@ -351,7 +351,7 @@ class FreeInventoryEvaluator:
         request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
         proxy_url: str = "",
         cloudflare_worker_url: str = "",
-        use_auto_free_proxies: bool = True,
+        use_auto_free_proxies: bool = False,
         db_path: Path = DEFAULT_INVENTORY_CACHE_DB,
         prices_cache_path: Path = DEFAULT_PRICE_CACHE_PATH,
         # Backward-compatibility kwargs:
@@ -379,6 +379,7 @@ class FreeInventoryEvaluator:
 
         self._queue: queue.Queue[str] = queue.Queue()
         self._in_queue_set: set[str] = set()
+        self._retry_counts: Dict[str, int] = {}
         self._lock = threading.Lock()
 
         self._running = False
@@ -475,42 +476,42 @@ class FreeInventoryEvaluator:
         pass
 
     def _init_database(self) -> None:
-        """Initialize or upgrade SQLite cache database."""
+        """Initialize SQLite cache database with composite cache_key."""
         try:
             conn = sqlite3.connect(self.db_path)
             try:
                 cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(inventory_cache)")
+                cols = {col[1] for col in cursor.fetchall()}
+                if cols and "cache_key" not in cols:
+                    # Upgrade legacy table where steam_id alone was primary key
+                    cursor.execute("DROP TABLE IF EXISTS inventory_cache")
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS inventory_cache (
-                        steam_id TEXT PRIMARY KEY,
+                        cache_key TEXT PRIMARY KEY,
+                        steam_id TEXT,
+                        currency TEXT,
                         value_usd REAL,
                         status TEXT,
                         error_message TEXT,
                         updated_at REAL,
-                        currency TEXT DEFAULT 'USD',
                         items_count INTEGER DEFAULT 0,
                         valued_items_count INTEGER DEFAULT 0
                     )
                     """
                 )
-                cursor.execute("PRAGMA table_info(inventory_cache)")
-                existing_cols = {col[1] for col in cursor.fetchall()}
-                if "currency" not in existing_cols:
-                    cursor.execute("ALTER TABLE inventory_cache ADD COLUMN currency TEXT DEFAULT 'USD'")
-                if "items_count" not in existing_cols:
-                    cursor.execute("ALTER TABLE inventory_cache ADD COLUMN items_count INTEGER DEFAULT 0")
-                if "valued_items_count" not in existing_cols:
-                    cursor.execute("ALTER TABLE inventory_cache ADD COLUMN valued_items_count INTEGER DEFAULT 0")
                 conn.commit()
             finally:
                 conn.close()
         except Exception as e:
             logger.error("Failed to initialize SQLite cache db: %s", e)
 
-    def get_cached_result(self, steam_id: str) -> Optional[InventoryValueResult]:
-        """Fetch result from SQLite cache if not expired (< 12 hours)."""
+    def get_cached_result(self, steam_id: str, currency: Optional[str] = None) -> Optional[InventoryValueResult]:
+        """Fetch result from SQLite cache if not expired (< 12 hours) matching currency."""
         sid64 = normalize_steam_id64(steam_id)
+        curr = (currency or self.currency).upper()
+        cache_key = f"{sid64}_{curr}"
         try:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -519,13 +520,13 @@ class FreeInventoryEvaluator:
                     """
                     SELECT steam_id, value_usd, status, error_message, updated_at,
                            currency, items_count, valued_items_count
-                    FROM inventory_cache WHERE steam_id = ?
+                    FROM inventory_cache WHERE cache_key = ?
                     """,
-                    (sid64,),
+                    (cache_key,),
                 )
                 row = cursor.fetchone()
                 if row:
-                    sid, val, status, err, updated_at, curr, it_count, val_count = row
+                    sid, val, status, err, updated_at, c, it_count, val_count = row
                     age = time.time() - updated_at
                     if age < self.cache_ttl_seconds:
                         return InventoryValueResult(
@@ -535,18 +536,21 @@ class FreeInventoryEvaluator:
                             cached=True,
                             error_message=err,
                             updated_at=updated_at,
-                            currency=curr or self.currency,
+                            currency=c or curr,
                             items_count=it_count or 0,
                             valued_items_count=val_count or 0,
                         )
             finally:
                 conn.close()
         except Exception as e:
-            logger.error("Error reading cache for %s: %s", sid64, e)
+            logger.error("Error reading cache for %s: %s", cache_key, e)
         return None
 
     def save_cached_result(self, result: InventoryValueResult) -> None:
         """Store evaluated result into SQLite cache."""
+        sid64 = normalize_steam_id64(result.steam_id)
+        curr = (result.currency or self.currency).upper()
+        cache_key = f"{sid64}_{curr}"
         try:
             conn = sqlite3.connect(self.db_path)
             try:
@@ -554,18 +558,19 @@ class FreeInventoryEvaluator:
                 cursor.execute(
                     """
                     INSERT OR REPLACE INTO inventory_cache (
-                        steam_id, value_usd, status, error_message, updated_at,
-                        currency, items_count, valued_items_count
+                        cache_key, steam_id, currency, value_usd, status, error_message, updated_at,
+                        items_count, valued_items_count
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        result.steam_id,
+                        cache_key,
+                        sid64,
+                        curr,
                         result.value_usd,
                         result.status,
                         result.error_message,
                         result.updated_at,
-                        result.currency,
                         result.items_count,
                         result.valued_items_count,
                     ),
@@ -574,7 +579,7 @@ class FreeInventoryEvaluator:
             finally:
                 conn.close()
         except Exception as e:
-            logger.error("Error saving cache for %s: %s", result.steam_id, e)
+            logger.error("Error saving cache for %s: %s", cache_key, e)
 
     def start(self) -> None:
         """Start price database loading and background queue worker."""
@@ -681,17 +686,32 @@ class FreeInventoryEvaluator:
                 result = self._fetch_and_calculate_inventory(session, sid64)
                 self._last_request_time = time.time()
 
-                # Handle 429 Too Many Requests: backoff pause and retry
+                # Handle 429 Too Many Requests: backoff pause and retry (up to 3 times)
                 if result.status == "RATE_LIMITED":
-                    logger.warning(
-                        "Steam rate-limit (429) hit for %s. Sleeping 7 seconds and retrying...",
-                        sid64,
-                    )
-                    time.sleep(7.0)
-                    self._queue.put(sid64)
-                    continue
+                    retries = self._retry_counts.get(sid64, 0) + 1
+                    self._retry_counts[sid64] = retries
+                    if retries <= 3:
+                        backoff = (2.0 ** retries) * 2.0  # 4s, 8s, 16s
+                        logger.warning(
+                            "Steam rate-limit (429) hit for %s. Retry %d/3 after %.1fs...",
+                            sid64,
+                            retries,
+                            backoff,
+                        )
+                        time.sleep(backoff)
+                        with self._lock:
+                            self._queue.put(sid64)
+                        continue
+                    else:
+                        logger.error("Max retries exceeded for %s on 429 rate limit.", sid64)
+                        result.status = "RATE_LIMIT"
+                        result.error_message = "Превышен лимит запросов Steam (429)"
+                        self._retry_counts.pop(sid64, None)
 
-                # Save successful and hidden responses to SQLite cache
+                # Reset retry counter on completion or final status
+                self._retry_counts.pop(sid64, None)
+
+                # Save to cache: only OK or genuine official Steam HIDDEN
                 if result.status in ("OK", "HIDDEN"):
                     self.save_cached_result(result)
 
@@ -704,10 +724,70 @@ class FreeInventoryEvaluator:
 
             except Exception as e:
                 logger.error("Unexpected error in FreeInventoryEvaluator worker for %s: %s", sid64, e)
+                self._retry_counts.pop(sid64, None)
             finally:
                 with self._lock:
-                    self._in_queue_set.discard(sid64)
+                    if sid64 not in self._retry_counts:
+                        self._in_queue_set.discard(sid64)
                 self._queue.task_done()
+
+    def _fetch_single_page(
+        self,
+        session: requests.Session,
+        url: str,
+        steam_id: str,
+    ) -> tuple[Optional[requests.Response], bool]:
+        """
+        Executes request for an inventory page.
+        Returns (response, is_guaranteed_steam).
+        Validates proxy responses, rejecting HTML error pages.
+        """
+        response = None
+        is_guaranteed_steam = False
+
+        # Attempt 1: direct or configured proxy
+        try:
+            logger.info("Fetching Steam inventory page for %s: %s", steam_id, url)
+            response = session.get(url, timeout=12.0)
+            if not self.proxy_url:
+                is_guaranteed_steam = True
+            else:
+                ct = response.headers.get("Content-Type", "").lower()
+                if response.status_code == 200 or "steam" in response.text.lower() or "application/json" in ct:
+                    is_guaranteed_steam = True
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            logger.warning("Steam request failed for %s (%s).", steam_id, exc)
+
+        # Attempt 2: fallback to auto free proxies if enabled
+        if (response is None or not response.ok) and self.use_auto_free_proxies:
+            for attempt in range(3):
+                free_proxy = self.proxy_provider.get_next_proxy()
+                if not free_proxy:
+                    break
+                logger.info("Retrying %s via free proxy: %s (attempt %d)...", steam_id, free_proxy, attempt + 1)
+                try:
+                    temp_proxies = {"http": free_proxy, "https": free_proxy}
+                    resp = session.get(url, proxies=temp_proxies, timeout=8.0)
+                    if resp and resp.ok:
+                        # Check if proxy returned HTML block page instead of JSON
+                        ct = resp.headers.get("Content-Type", "").lower()
+                        sample = resp.text[:200].lower()
+                        if "text/html" in ct or "<html" in sample or "<!doctype" in sample:
+                            logger.warning("Proxy %s returned HTML error page, rejecting...", free_proxy)
+                            continue
+                        response = resp
+                        is_guaranteed_steam = True
+                        logger.info("Success using free proxy %s for %s!", free_proxy, steam_id)
+                        break
+                    elif resp and resp.status_code == 403:
+                        ct = resp.headers.get("Content-Type", "").lower()
+                        if "text/html" in ct or "<html" in resp.text[:200].lower():
+                            logger.warning("Proxy %s returned proxy 403 HTML page, rejecting...", free_proxy)
+                            continue
+                except Exception:
+                    continue
+
+        return response, is_guaranteed_steam
 
     def _fetch_and_calculate_inventory(
         self,
@@ -715,101 +795,84 @@ class FreeInventoryEvaluator:
         steam_id: str,
     ) -> InventoryValueResult:
         """
-        Fetch Steam Community inventory, parse items and calculate total value.
+        Fetch Steam Community inventory with pagination, parse items and calculate value.
         Supports Cloudflare Worker, custom proxy, and auto-fallback to Proxyscrape proxies.
         """
-        target_url = build_inventory_url(
+        target_base_url = build_inventory_url(
             steam_id=steam_id,
             custom_url=self.cloudflare_worker_url or (self.proxy_url if "workers.dev" in self.proxy_url else ""),
         )
 
-        response = None
-        # Attempt 1: Direct or configured proxy
-        try:
-            logger.info("Fetching Steam inventory for %s from %s", steam_id, target_url)
-            response = session.get(target_url, timeout=12.0)
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-            logger.warning("Steam request failed for %s (%s).", steam_id, exc)
-            if self.use_auto_free_proxies:
-                # Try fallback via auto free proxies from Proxyscrape
-                for attempt in range(2):
-                    free_proxy = self.proxy_provider.get_next_proxy()
-                    if not free_proxy:
-                        break
-                    logger.info("Retrying %s via free proxy: %s (attempt %d)...", steam_id, free_proxy, attempt + 1)
-                    try:
-                        temp_proxies = {"http": free_proxy, "https": free_proxy}
-                        response = session.get(target_url, proxies=temp_proxies, timeout=8.0)
-                        if response and response.ok:
-                            logger.info("Success using free proxy %s for %s!", free_proxy, steam_id)
-                            break
-                    except Exception:
-                        continue
-
-        if response is None:
-            return InventoryValueResult(
-                steam_id=steam_id,
-                value_usd=None,
-                status="ERROR",
-                error_message="Таймаут Steam (укажите прокси или worker)",
-                currency=self.currency,
-            )
+        all_assets: List[dict] = []
+        all_descriptions: List[dict] = []
+        start_assetid: Optional[str] = None
+        MAX_PAGES = 5
 
         try:
-            # 1. Rate-limiting check
-            if response.status_code == 429:
-                return InventoryValueResult(
-                    steam_id=steam_id,
-                    value_usd=None,
-                    status="RATE_LIMITED",
-                    error_message="Рейт-лимит Steam (429)",
-                    currency=self.currency,
-                )
+            for page_idx in range(MAX_PAGES):
+                page_url = target_base_url
+                if start_assetid:
+                    sep = "&" if "?" in page_url else "?"
+                    page_url = f"{page_url}{sep}start_assetid={start_assetid}"
 
-            # 2. Privacy check: 403 Forbidden -> status [Скрыт]
-            if response.status_code == 403:
-                return InventoryValueResult(
-                    steam_id=steam_id,
-                    value_usd=0.0,
-                    status="HIDDEN",
-                    error_message="Инвентарь скрыт настройками приватности",
-                    currency=self.currency,
-                )
+                response, is_guaranteed_steam = self._fetch_single_page(session, page_url, steam_id)
 
-            if not response.ok:
-                return InventoryValueResult(
-                    steam_id=steam_id,
-                    value_usd=None,
-                    status="ERROR",
-                    error_message=f"HTTP {response.status_code}",
-                    currency=self.currency,
-                )
+                if response is None:
+                    if page_idx == 0:
+                        return InventoryValueResult(
+                            steam_id=steam_id,
+                            value_usd=None,
+                            status="ERROR",
+                            error_message="Таймаут Steam (укажите прокси или worker)",
+                            currency=self.currency,
+                        )
+                    break
 
-            # 3. Parse JSON response
-            try:
-                data = response.json()
-            except Exception:
-                text = response.text.lower()
-                if "private" in text or "hidden" in text:
+                # 1. Rate-limiting check
+                if response.status_code == 429:
                     return InventoryValueResult(
                         steam_id=steam_id,
-                        value_usd=0.0,
-                        status="HIDDEN",
+                        value_usd=None,
+                        status="RATE_LIMITED",
+                        error_message="Рейт-лимит Steam (429)",
                         currency=self.currency,
                     )
-                return InventoryValueResult(
-                    steam_id=steam_id,
-                    value_usd=None,
-                    status="ERROR",
-                    error_message="Некорректный JSON от Steam",
-                    currency=self.currency,
-                )
 
-            # Check if JSON payload indicates privacy or error
-            if isinstance(data, dict):
-                if data.get("success") is False or data.get("error"):
-                    err_msg = str(data.get("error", "")).lower()
-                    if "private" in err_msg or "hidden" in err_msg or "null" in err_msg:
+                # 2. Privacy check: 403 Forbidden
+                if response.status_code == 403:
+                    if is_guaranteed_steam:
+                        return InventoryValueResult(
+                            steam_id=steam_id,
+                            value_usd=0.0,
+                            status="HIDDEN",
+                            error_message="Инвентарь скрыт настройками приватности",
+                            currency=self.currency,
+                        )
+                    else:
+                        # Proxy error 403: do NOT cache as HIDDEN
+                        return InventoryValueResult(
+                            steam_id=steam_id,
+                            value_usd=None,
+                            status="ERROR",
+                            error_message="Ошибка прокси (403)",
+                            currency=self.currency,
+                        )
+
+                if not response.ok:
+                    return InventoryValueResult(
+                        steam_id=steam_id,
+                        value_usd=None,
+                        status="ERROR",
+                        error_message=f"HTTP {response.status_code}",
+                        currency=self.currency,
+                    )
+
+                # 3. Parse JSON response
+                try:
+                    data = response.json()
+                except Exception:
+                    text_low = response.text.lower()
+                    if ("private" in text_low or "hidden" in text_low) and is_guaranteed_steam:
                         return InventoryValueResult(
                             steam_id=steam_id,
                             value_usd=0.0,
@@ -820,28 +883,58 @@ class FreeInventoryEvaluator:
                         steam_id=steam_id,
                         value_usd=None,
                         status="ERROR",
-                        error_message=data.get("error", "Steam error"),
+                        error_message="Некорректный JSON от Steam",
                         currency=self.currency,
                     )
 
-            assets = data.get("assets") or []
-            descriptions = data.get("descriptions") or []
+                # Check if JSON payload indicates privacy or error
+                if isinstance(data, dict):
+                    if data.get("success") is False or data.get("error"):
+                        err_msg = str(data.get("error", "")).lower()
+                        if ("private" in err_msg or "hidden" in err_msg or "null" in err_msg) and is_guaranteed_steam:
+                            return InventoryValueResult(
+                                steam_id=steam_id,
+                                value_usd=0.0,
+                                status="HIDDEN",
+                                currency=self.currency,
+                            )
+                        return InventoryValueResult(
+                            steam_id=steam_id,
+                            value_usd=None,
+                            status="ERROR",
+                            error_message=data.get("error", "Steam error"),
+                            currency=self.currency,
+                        )
 
-            # Empty inventory -> status [Скрыт]
-            if not assets:
-                return InventoryValueResult(
-                    steam_id=steam_id,
-                    value_usd=0.0,
-                    status="HIDDEN",
-                    currency=self.currency,
-                    items_count=0,
-                    valued_items_count=0,
-                )
+                page_assets = data.get("assets") or []
+                page_desc = data.get("descriptions") or []
+
+                # If first page has 0 items, inventory is empty / hidden
+                if page_idx == 0 and not page_assets:
+                    return InventoryValueResult(
+                        steam_id=steam_id,
+                        value_usd=0.0,
+                        status="HIDDEN",
+                        currency=self.currency,
+                        items_count=0,
+                        valued_items_count=0,
+                    )
+
+                all_assets.extend(page_assets)
+                all_descriptions.extend(page_desc)
+
+                # Check pagination
+                more_items = data.get("more_items")
+                last_assetid = data.get("last_assetid")
+                if not more_items or not last_assetid:
+                    break
+                start_assetid = str(last_assetid)
+                time.sleep(0.3)
 
             # 4. Map descriptions by (classid, instanceid) and fallback by classid
             desc_map: Dict[tuple[str, str], dict] = {}
             class_map: Dict[str, dict] = {}
-            for d in descriptions:
+            for d in all_descriptions:
                 cid = str(d.get("classid", ""))
                 iid = str(d.get("instanceid", "0"))
                 desc_map[(cid, iid)] = d
@@ -849,12 +942,12 @@ class FreeInventoryEvaluator:
                     class_map[cid] = d
 
             total_val = 0.0
-            items_count = len(assets)
+            items_count = len(all_assets)
             valued_items_count = 0
             top_items: List[Dict[str, Any]] = []
 
             # 5. Calculate valuation
-            for a in assets:
+            for a in all_assets:
                 cid = str(a.get("classid", ""))
                 iid = str(a.get("instanceid", "0"))
                 desc = desc_map.get((cid, iid)) or class_map.get(cid)
@@ -898,7 +991,7 @@ class FreeInventoryEvaluator:
             top_items.sort(key=lambda x: x["total"], reverse=True)
 
             logger.info(
-                "Calculated inventory for %s: %s (counted %d items >= %.2f, total items: %d)",
+                "Calculated inventory for %s: %s (counted %d items >= %.2f, total items: %d across pages)",
                 steam_id,
                 f"${total_val:,.2f}" if self.currency == "USD" else f"{total_val:,.2f} {self.currency}",
                 valued_items_count,

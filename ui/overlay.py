@@ -10,21 +10,18 @@ import json
 import logging
 import os
 import webbrowser
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PyQt6.QtCore import QPoint, QRect, Qt, pyqtSignal, QObject
-from PyQt6.QtGui import QColor, QCursor, QFont, QIcon, QPainter, QPen, QBrush
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen, QBrush
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
-    QGraphicsDropShadowEffect,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -32,7 +29,6 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSlider,
     QTabWidget,
-    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -506,7 +502,7 @@ class OverlayWindow(QWidget):
         layout.addStretch()
 
         init_sym = "₽" if getattr(self, "currency", "USD") == "RUB" else "$"
-        init_txt = f"Сумма: $0.00" if init_sym == "$" else "Сумма: 0.00 ₽"
+        init_txt = "Сумма: $0.00" if init_sym == "$" else "Сумма: 0.00 ₽"
         self.lbl_total_val = QLabel(init_txt)
         self.lbl_total_val.setStyleSheet("color: #ffb703; font-weight: bold; font-size: 12px;")
         layout.addWidget(self.lbl_total_val)
@@ -928,17 +924,30 @@ class OverlayWindow(QWidget):
     def _create_player_card(self, index: int, player: CoplayPlayer) -> QWidget:
         card = QFrame()
         card.setObjectName("PlayerCard")
-        card.setStyleSheet("""
-            #PlayerCard {
-                background-color: #161924;
-                border: 1px solid #222738;
-                border-radius: 8px;
-            }
-            #PlayerCard:hover {
-                border: 1px solid #2e354d;
-                background-color: #1a1e2b;
-            }
-        """)
+        if not player.is_delta:
+            card.setStyleSheet("""
+                #PlayerCard {
+                    background-color: #12141d;
+                    border: 1px dashed #222638;
+                    border-radius: 8px;
+                }
+                #PlayerCard:hover {
+                    border: 1px solid #2e354d;
+                    background-color: #161924;
+                }
+            """)
+        else:
+            card.setStyleSheet("""
+                #PlayerCard {
+                    background-color: #161924;
+                    border: 1px solid #222738;
+                    border-radius: 8px;
+                }
+                #PlayerCard:hover {
+                    border: 1px solid #2e354d;
+                    background-color: #1a1e2b;
+                }
+            """)
 
         layout = QHBoxLayout(card)
         layout.setContentsMargins(10, 8, 10, 8)
@@ -954,8 +963,13 @@ class OverlayWindow(QWidget):
         info_col.setSpacing(2)
 
         name_display = player.name if player.name and player.name != "Unknown" else f"Игрок {player.steam_id[-4:]}"
+        if not player.is_delta:
+            name_display = f"{name_display} (из истории)"
         lbl_name = QLabel(name_display)
-        lbl_name.setStyleSheet("color: #ffffff; font-weight: 600; font-size: 13px;")
+        if not player.is_delta:
+            lbl_name.setStyleSheet("color: #7b839b; font-weight: 500; font-size: 12px;")
+        else:
+            lbl_name.setStyleSheet("color: #ffffff; font-weight: 600; font-size: 13px;")
         info_col.addWidget(lbl_name)
 
         sid_row = QHBoxLayout()
@@ -994,8 +1008,9 @@ class OverlayWindow(QWidget):
         lbl_val.setAlignment(Qt.AlignmentFlag.AlignRight)
         val_col.addWidget(lbl_val)
 
-        lbl_status = QLabel("В очереди")
-        lbl_status.setStyleSheet("color: #8f9bb3; font-size: 10px;")
+        status_text = "В очереди" if player.is_delta else "Из истории"
+        lbl_status = QLabel(status_text)
+        lbl_status.setStyleSheet("color: #626a80; font-size: 10px;" if not player.is_delta else "color: #8f9bb3; font-size: 10px;")
         lbl_status.setAlignment(Qt.AlignmentFlag.AlignRight)
         val_col.addWidget(lbl_status)
 

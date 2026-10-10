@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core.settings import Settings
-from .theme import ACCENT, TEXT_DIM
+from .theme import ACCENT
 from .widgets import Card, GhostButton, NeonButton, dim_label
 
 LANGUAGES = [

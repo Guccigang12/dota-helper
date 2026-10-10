@@ -3,7 +3,6 @@ from __future__ import annotations
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -15,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core.settings import Settings
-from .theme import ACCENT, GOLD, RADIANT, TEXT, TEXT_DIM
+from .theme import ACCENT, GOLD, RADIANT, TEXT
 from .widgets import Card, GhostButton, NeonButton, ToggleSwitch, dim_label
 
 PROVIDERS = [

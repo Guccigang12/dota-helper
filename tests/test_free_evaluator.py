@@ -1,22 +1,21 @@
 import gc
 import os
-import sqlite3
-import time
+import sys
+import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from core.free_evaluator import (
     FreeInventoryEvaluator,
-    FreeEvaluator,
     DotaPriceManager,
     FreeProxyProvider,
-    InventoryValueResult,
     normalize_steam_id64,
     build_inventory_url,
     normalize_proxy_dict,
 )
-from core.chat_translator import get_screen_dpi_scale
+from core.chat_translator import ChatVisionTranslator, get_screen_dpi_scale
+from core.steam_coplay import SteamCoplayManager
 
 
 class TestFreeInventoryEvaluator(unittest.TestCase):
@@ -61,12 +60,30 @@ class TestFreeInventoryEvaluator(unittest.TestCase):
         p_bare = normalize_proxy_dict("127.0.0.1:8080")
         self.assertEqual(p_bare, {"http": "http://127.0.0.1:8080", "https": "http://127.0.0.1:8080"})
 
-    def test_price_manager(self):
-        pm = DotaPriceManager(currency="USD")
-        prices = pm.load_prices()
-        self.assertGreater(len(prices), 10000)
-        self.assertGreater(pm.get_price("Dragonclaw Hook"), 50.0)
-        self.assertEqual(pm.get_price("NonExistentItem12345"), 0.0)
+    @patch("requests.get")
+    def test_price_manager(self, mock_get):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.ok = True
+        mock_resp.json.return_value = {
+            "success": True,
+            "items": [
+                {"market_hash_name": "Dragonclaw Hook", "price": "145.50"},
+                {"market_hash_name": "Arcana Blade", "price": "29.99"},
+            ],
+        }
+        mock_get.return_value = mock_resp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "prices_cache.json"
+            pm = DotaPriceManager(currency="USD", cache_path=cache_file)
+            prices = pm.load_prices()
+            self.assertEqual(len(prices), 2)
+            self.assertGreater(pm.get_price("Dragonclaw Hook"), 50.0)
+            self.assertEqual(pm.get_price("Arcana Blade"), 29.99)
+            self.assertEqual(pm.get_price("NonExistentItem12345"), 0.0)
+            # Ensure mock was called because cache did not exist initially
+            mock_get.assert_called_once()
 
     def test_inventory_calculation_and_05_dollar_filter(self):
         db_path = Path("test_inv_cache.db")
@@ -158,10 +175,106 @@ class TestFreeInventoryEvaluator(unittest.TestCase):
         self.assertTrue(hasattr(provider, "get_next_proxy"))
         self.assertTrue(hasattr(provider, "fetch_proxies"))
 
+    @unittest.skipUnless(sys.platform == "win32", "Требуется Windows GUI")
     def test_dpi_scaling_helper(self):
         scale = get_screen_dpi_scale()
         self.assertIsInstance(scale, float)
         self.assertGreater(scale, 0.0)
+
+    def test_parse_json_messages(self):
+        # 1. Clean pure JSON
+        clean_json = '{"messages": [{"source": "中单", "kind": "Сленг", "translation": "мидер"}]}'
+        msgs = ChatVisionTranslator._parse_json_messages(clean_json)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0].source, "中单")
+        self.assertEqual(msgs[0].kind, "Сленг")
+        self.assertEqual(msgs[0].translation, "мидер")
+
+        # 2. Markdown fenced code block
+        md_json = """Here is the translation:
+```json
+{
+  "messages": [
+    {"source": "bkb", "kind": "Сленг", "translation": "БКБ"},
+    {"source": "ff", "kind": "Сленг", "translation": "сдаемся"}
+  ]
+}
+```
+Thanks!"""
+        msgs_md = ChatVisionTranslator._parse_json_messages(md_json)
+        self.assertEqual(len(msgs_md), 2)
+        self.assertEqual(msgs_md[0].source, "bkb")
+        self.assertEqual(msgs_md[0].translation, "БКБ")
+        self.assertEqual(msgs_md[1].source, "ff")
+        self.assertEqual(msgs_md[1].translation, "сдаемся")
+
+        # 3. Broken JSON containing braces
+        broken_json = '{"messages": [ invalid syntax }'
+        msgs_broken = ChatVisionTranslator._parse_json_messages(broken_json)
+        self.assertEqual(msgs_broken, [])
+
+        # 4. Fallback: plaintext without JSON braces
+        plain_text = "Пушьте мид быстрее"
+        msgs_plain = ChatVisionTranslator._parse_json_messages(plain_text)
+        self.assertEqual(len(msgs_plain), 1)
+        self.assertEqual(msgs_plain[0].source, "Чат")
+        self.assertEqual(msgs_plain[0].kind, "Текст")
+        self.assertEqual(msgs_plain[0].translation, "Пушьте мид быстрее")
+
+        # 5. Empty content
+        self.assertEqual(ChatVisionTranslator._parse_json_messages(""), [])
+
+    def test_compute_delta_lobby(self):
+        manager = SteamCoplayManager(dll_path="nonexistent.dll")
+        # Baseline contains old players from prior match
+        manager.baseline_snapshot = {
+            1001: 1000,
+            1002: 1000,
+            1003: 1000,
+        }
+
+        # snap1 at HERO_SELECTION: player 1004 has joined with newer timestamp
+        snap1 = {
+            1001: 1000,
+            1002: 1000,
+            1003: 1000,
+            1004: 2000,
+        }
+
+        # snap2 after 3.5s delay: player 1005 has joined
+        snap2 = {
+            1001: 1000,
+            1002: 1000,
+            1003: 1000,
+            1004: 2000,
+            1005: 2050,
+        }
+
+        # Local player is 1001 (must be excluded from lobby candidates)
+        players = manager._compute_delta_lobby(snap1, snap2, local_steam_id="1001")
+
+        # Verify self is excluded
+        self.assertNotIn("1001", [p.steam_id for p in players])
+
+        # Players 1004 and 1005 are true delta
+        delta_players = [p for p in players if p.is_delta]
+        self.assertEqual({p.steam_id for p in delta_players}, {"1004", "1005"})
+
+        # Historical players (1002, 1003) added as fillers have is_delta=False
+        fillers = [p for p in players if not p.is_delta]
+        self.assertEqual({p.steam_id for p in fillers}, {"1002", "1003"})
+
+        # Empty baseline test: delta is determined strictly between snap1 and snap2
+        manager.baseline_snapshot = {}
+        snap_a = {2001: 500, 2002: 500}
+        snap_b = {2001: 500, 2002: 500, 2003: 600}
+        res_empty_base = manager._compute_delta_lobby(snap_a, snap_b, local_steam_id="9999")
+        # 2003 was added in snap_b relative to snap_a -> is_delta=True
+        delta_ids = [p.steam_id for p in res_empty_base if p.is_delta]
+        filler_ids = [p.steam_id for p in res_empty_base if not p.is_delta]
+        self.assertIn("2003", delta_ids)
+        self.assertIn("2001", filler_ids)
+        self.assertIn("2002", filler_ids)
 
 
 if __name__ == "__main__":

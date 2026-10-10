@@ -1,8 +1,9 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from dota_companion.core.settings import Settings, ChatRegion
+from dota_companion.core.settings import Settings
 from dota_companion.ocr.translator import Translator
 from dota_companion.ocr.slang import enhance_text_with_slang
 from dota_companion.ocr.capturer import ScreenCapturer
@@ -62,6 +63,7 @@ class TestDotaCompanion(unittest.TestCase):
         self.assertIsInstance(enhanced, str)
         self.assertTrue(len(enhanced) >= len(text))
 
+    @unittest.skipUnless(sys.platform == "win32", "Требуется Windows GUI")
     def test_screen_capturer_thread_safety(self):
         capturer = ScreenCapturer()
         self.assertTrue(hasattr(capturer, "_lock"))

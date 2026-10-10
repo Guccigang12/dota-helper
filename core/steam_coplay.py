@@ -9,12 +9,11 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("DotaHelper.SteamCoplay")
 
@@ -50,6 +49,8 @@ class SteamCoplayManager:
 
         self._lock = threading.Lock()
         self._scan_thread: Optional[threading.Thread] = None
+        self._callback_thread: Optional[threading.Thread] = None
+        self._callback_stop_event = threading.Event()
 
         # Callbacks
         self.on_lobby_detected: Optional[Callable[[List[CoplayPlayer]], None]] = None
@@ -135,6 +136,8 @@ class SteamCoplayManager:
             if hasattr(self._dll, "SteamAPI_SteamFriends_v018"):
                 self._dll.SteamAPI_SteamFriends_v018.restype = ctypes.c_void_p
                 self._p_friends = self._dll.SteamAPI_SteamFriends_v018()
+            else:
+                logger.warning("SteamAPI_SteamFriends_v018 interface not found in %s! Incompatible DLL version?", self.dll_path)
 
             # Set function signatures for ISteamFriends
             if hasattr(self._dll, "SteamAPI_ISteamFriends_GetCoplayFriendCount"):
@@ -175,9 +178,14 @@ class SteamCoplayManager:
                     if local_id:
                         self.local_steam_id = str(local_id)
                         logger.info("Local SteamID: %s", self.local_steam_id)
+            else:
+                logger.warning("SteamAPI_SteamUser_v023 interface not found in %s! Incompatible DLL version?", self.dll_path)
 
             self.is_initialized = True
             logger.info("Steamworks SDK initialized successfully!")
+
+            # Start background callbacks pump (every 300-500 ms)
+            self._start_callback_pump()
 
             # Take initial baseline snapshot
             self.baseline_snapshot = self.get_coplay_snapshot()
@@ -189,8 +197,35 @@ class SteamCoplayManager:
             self.is_initialized = False
             return False
 
+    def _start_callback_pump(self) -> None:
+        """Start background daemon thread pumping SteamAPI_RunCallbacks periodically."""
+        if self._callback_thread and self._callback_thread.is_alive():
+            return
+        self._callback_stop_event.clear()
+        self._callback_thread = threading.Thread(
+            target=self._callback_pump_worker,
+            name="SteamCallbackPump",
+            daemon=True,
+        )
+        self._callback_thread.start()
+        logger.debug("Steamworks callback pump thread started.")
+
+    def _stop_callback_pump(self) -> None:
+        """Stop background callback pump thread."""
+        self._callback_stop_event.set()
+        if self._callback_thread and self._callback_thread.is_alive():
+            self._callback_thread.join(timeout=1.0)
+        self._callback_thread = None
+
+    def _callback_pump_worker(self) -> None:
+        """Periodically pump Steamworks callbacks (every 300-400 ms) so persona names resolve asynchronously."""
+        while not self._callback_stop_event.is_set():
+            self.run_callbacks()
+            self._callback_stop_event.wait(0.35)
+
     def shutdown(self) -> None:
         """Shutdown Steamworks SDK cleanly."""
+        self._stop_callback_pump()
         if self.is_initialized and self._dll and hasattr(self._dll, "SteamAPI_Shutdown"):
             try:
                 self._dll.SteamAPI_Shutdown()
@@ -267,19 +302,25 @@ class SteamCoplayManager:
         self._scan_thread.start()
 
     def _scan_lobby_worker(self, local_steam_id: Optional[str], delay_seconds: float) -> None:
-        """Worker thread executing the delta lobby detection."""
+        """Worker thread executing the 2-step delta lobby detection."""
         logger.info("Starting lobby detection scan (delay: %.1fs)...", delay_seconds)
 
-        # Snapshot #1
+        # Snapshot #1 (immediately upon HERO_SELECTION)
         snap1 = self.get_coplay_snapshot()
         time.sleep(delay_seconds)
 
-        # Snapshot #2
+        # Snapshot #2 (after 3-4s delay)
         snap2 = self.get_coplay_snapshot()
 
-        # Compute delta players
-        lobby_players = self._compute_delta_lobby(snap2, local_steam_id)
-        logger.info("Lobby detection completed: found %d players.", len(lobby_players))
+        # Compute delta players comparing snap2 against snap1 and baseline
+        lobby_players = self._compute_delta_lobby(snap1, snap2, local_steam_id)
+        delta_count = sum(1 for p in lobby_players if p.is_delta)
+        logger.info(
+            "Lobby detection completed: %d players total (%d delta candidates, %d historical fillers).",
+            len(lobby_players),
+            delta_count,
+            len(lobby_players) - delta_count,
+        )
 
         if self.on_lobby_detected:
             try:
@@ -287,44 +328,80 @@ class SteamCoplayManager:
             except Exception as e:
                 logger.error("Error in on_lobby_detected callback: %s", e)
 
-    def _compute_delta_lobby(self, current_snapshot: Dict[int, int], local_steam_id: Optional[str]) -> List[CoplayPlayer]:
+    def _compute_delta_lobby(
+        self,
+        snap1: Dict[int, int],
+        snap2: Optional[Dict[int, int]] = None,
+        local_steam_id: Optional[str] = None,
+    ) -> List[CoplayPlayer]:
         """
-        Compare current snapshot against baseline to determine the 9 players in current lobby.
+        Compare snap2 and snap1 against baseline to determine the 9 players in current lobby.
+        True delta candidates are players in snap2 who:
+          - appeared / were updated between snap1 and snap2, OR
+          - appeared / were updated relative to baseline.
+        If fewer than 9 delta players are found, supplements with the most recent historical entries (is_delta=False).
         """
+        # Backward compatibility if called as _compute_delta_lobby(snap2, local_steam_id)
+        if snap2 is not None and not isinstance(snap2, dict):
+            local_steam_id = str(snap2) if snap2 else None
+            snap2 = snap1
+            snap1 = {}
+        elif snap2 is None:
+            snap2 = snap1
+            snap1 = {}
+
         with self._lock:
-            local_id_int = int(local_steam_id) if local_steam_id and local_steam_id.isdigit() else None
+            local_id_int = int(local_steam_id) if local_steam_id and str(local_steam_id).isdigit() else None
 
-            delta_entries: List[tuple[int, int, bool]] = []  # (steam_id, coplay_time, is_delta)
+            # Merge all available players across both snapshots
+            all_candidates: Dict[int, int] = dict(snap1)
+            all_candidates.update(snap2)
 
-            # Check delta against baseline
-            for steam_id, coplay_time in current_snapshot.items():
+            delta_entries: List[Tuple[int, int]] = []
+            filler_entries: List[Tuple[int, int]] = []
+
+            for steam_id, coplay_time in all_candidates.items():
                 if local_id_int and steam_id == local_id_int:
                     continue  # Exclude self
 
-                baseline_time = self.baseline_snapshot.get(steam_id)
-                if baseline_time is None or coplay_time > baseline_time:
-                    delta_entries.append((steam_id, coplay_time, True))
+                # Check 1: Appeared / updated between snap1 and snap2
+                is_new_in_snap2 = (steam_id not in snap1) or (snap2.get(steam_id, 0) > snap1.get(steam_id, 0))
 
-            # If Steam lag caused fewer than 9 delta entries, supplement with the most recent entries
-            if len(delta_entries) < 9:
-                already_picked = {s for s, _, _ in delta_entries}
-                sorted_all = sorted(
-                    [(s, t) for s, t in current_snapshot.items() if (local_id_int is None or s != local_id_int)],
-                    key=lambda x: x[1],
-                    reverse=True,
-                )
-                for s, t in sorted_all:
-                    if s not in already_picked:
-                        delta_entries.append((s, t, False))
-                    if len(delta_entries) >= 9:
+                # Check 2: Appeared / updated relative to baseline
+                is_new_vs_baseline = False
+                if self.baseline_snapshot:
+                    is_new_vs_baseline = (steam_id not in self.baseline_snapshot) or (coplay_time > self.baseline_snapshot.get(steam_id, 0))
+
+                if self.baseline_snapshot:
+                    is_delta = is_new_in_snap2 or is_new_vs_baseline
+                else:
+                    # Baseline was empty: delta is strictly what appeared between snap1 and snap2
+                    is_delta = is_new_in_snap2 if snap1 else True
+
+                if is_delta:
+                    delta_entries.append((steam_id, coplay_time))
+                else:
+                    filler_entries.append((steam_id, coplay_time))
+
+            # Sort both pools by coplay_time descending
+            delta_entries.sort(key=lambda x: x[1], reverse=True)
+            filler_entries.sort(key=lambda x: x[1], reverse=True)
+
+            selected_entries: List[Tuple[int, int, bool]] = []
+            for s, t in delta_entries[:9]:
+                selected_entries.append((s, t, True))
+
+            # Supplement with historical fillers if delta < 9
+            if len(selected_entries) < 9:
+                already_in = {s for s, _, _ in selected_entries}
+                for s, t in filler_entries:
+                    if s not in already_in:
+                        selected_entries.append((s, t, False))
+                    if len(selected_entries) >= 9:
                         break
 
-            # Limit to top 9 sorted by coplay_time descending
-            delta_entries.sort(key=lambda x: x[1], reverse=True)
-            top_9 = delta_entries[:9]
-
             results: List[CoplayPlayer] = []
-            for steam_id, coplay_time, is_delta in top_9:
+            for steam_id, coplay_time, is_delta in selected_entries:
                 name = self.get_player_persona_name(steam_id)
                 results.append(
                     CoplayPlayer(

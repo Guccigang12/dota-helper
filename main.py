@@ -6,19 +6,19 @@ OpenRouter Vision chat translation, and the Qt overlay.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
-import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 from core.gsi_server import GSIServer, install_gsi_config
 from core.steam_coplay import SteamCoplayManager
-from core.free_evaluator import FreeInventoryEvaluator, InventoryValueResult
+from core.free_evaluator import FreeInventoryEvaluator
 from core.chat_translator import ChatVisionTranslator
 from core.soundpad import SoundpadManager
 from ui.overlay import OverlayWindow
@@ -47,7 +47,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "inventory_checker": {
         "proxy_url": "",
         "cloudflare_worker_url": "",
-        "use_auto_free_proxies": True,
+        "use_auto_free_proxies": False,
         "cache_ttl_hours": 12,
         "request_interval_seconds": 1.5,
         "min_item_price": 0.5,
@@ -83,34 +83,36 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
-def load_or_create_config() -> Dict[str, Any]:
+def load_or_create_config(cfg_path: Optional[Path | str] = None) -> Dict[str, Any]:
     """Load config.json or generate defaults if missing."""
-    if not CONFIG_FILE.exists():
+    target_path = Path(cfg_path) if cfg_path else CONFIG_FILE
+    if not target_path.exists():
         try:
-            CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
-            logger.info("Created default config.json")
+            target_path.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
+            logger.info("Created default %s", target_path)
             return DEFAULT_CONFIG
         except Exception as e:
             logger.error("Could not write default config: %s", e)
             return DEFAULT_CONFIG
 
     try:
-        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        data = json.loads(target_path.read_text(encoding="utf-8"))
         return data
     except Exception as e:
-        logger.error("Failed to parse config.json, using defaults: %s", e)
+        logger.error("Failed to parse config from %s, using defaults: %s", target_path, e)
         return DEFAULT_CONFIG
 
 
 class DotaHelperApp:
     """Core controller gluing together all modules."""
 
-    def __init__(self, qapp: QApplication) -> None:
+    def __init__(self, qapp: QApplication, config_path: Optional[Path | str] = None) -> None:
         self.qapp = qapp
-        self.config = load_or_create_config()
+        self.config_path = Path(config_path) if config_path else CONFIG_FILE
+        self.config = load_or_create_config(self.config_path)
 
         # 1. Initialize UI Overlay
-        self.overlay = OverlayWindow(config_path=CONFIG_FILE)
+        self.overlay = OverlayWindow(config_path=self.config_path)
 
         # 2. Setup GSI Server & Auto-install Dota 2 cfg
         gsi_cfg = self.config.get("gsi", {})
@@ -344,6 +346,25 @@ class DotaHelperApp:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="DotaHelper — VAC-Safe Dota 2 Companion")
+    parser.add_argument(
+        "--companion",
+        action="store_true",
+        help="Launch in standalone Dota Companion mode (OCR translator & Soundpad tabbed UI)",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.json",
+        help="Path to custom configuration file (default: config.json)",
+    )
+    args, unknown = parser.parse_known_args()
+
+    if args.companion:
+        logger.info("Launching standalone Dota Companion mode (--companion)...")
+        from dota_companion.__main__ import main as run_companion
+        return run_companion()
+
     # High DPI scaling
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -353,7 +374,7 @@ def main() -> int:
     app.setApplicationName("Dota Helper")
     app.setOrganizationName("DotaHelper")
 
-    helper_app = DotaHelperApp(app)
+    helper_app = DotaHelperApp(app, config_path=args.config)
     app.aboutToQuit.connect(helper_app.shutdown)
 
     helper_app.start()

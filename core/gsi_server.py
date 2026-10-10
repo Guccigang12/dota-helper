@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import re
-import sys
 import threading
 import winreg
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -108,8 +107,13 @@ def find_dota_cfg_directory() -> Optional[Path]:
         manifest = lib / "steamapps" / "appmanifest_570.acf"
         if manifest.exists():
             cfg_via_manifest = lib / "steamapps" / "common" / "dota 2 beta" / "game" / "dota" / "cfg"
-            cfg_via_manifest.mkdir(parents=True, exist_ok=True)
-            return cfg_via_manifest
+            if cfg_via_manifest.exists():
+                logger.info("Found Dota 2 cfg directory: %s", cfg_via_manifest)
+                return cfg_via_manifest
+            # Only return path if dota game directory physically exists (no side-effects / mkdir)
+            dota_game_dir = lib / "steamapps" / "common" / "dota 2 beta" / "game" / "dota"
+            if dota_game_dir.exists():
+                return cfg_via_manifest
 
     return None
 
@@ -122,6 +126,13 @@ def install_gsi_config(auth_token: str = "DOTAHELPER_GSI_SECRET_KEY", port: int 
     cfg_dir = find_dota_cfg_directory()
     if not cfg_dir:
         logger.warning("Could not find Dota 2 installation folder to install GSI config.")
+        return None
+
+    try:
+        # Create directory explicitly during installation, not during discovery
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error("Could not create Dota 2 cfg directory %s: %s", cfg_dir, e)
         return None
 
     cfg_file = cfg_dir / "gamestate_integration_dotahelper.cfg"
@@ -172,13 +183,22 @@ class GSIRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            body = self.rfile.read(content_length)
+            # Limit incoming body read to 64KB (Dota GSI payloads never exceed 32KB)
+            to_read = min(content_length, 65536)
+            body = self.rfile.read(to_read)
             payload = json.loads(body.decode("utf-8", errors="replace"))
 
-            # Token validation
+            # Token validation: reject if server token not set, do not leak received token in log
+            server_token = (self.server.auth_token or "").strip()
+            if not server_token:
+                logger.warning("GSI payload rejected: server auth_token is empty or not configured")
+                self.send_response(403)
+                self.end_headers()
+                return
+
             auth_token = payload.get("auth", {}).get("token")
-            if self.server.auth_token and auth_token != self.server.auth_token:
-                logger.warning("Unauthorized GSI payload received: token mismatch (%s)", auth_token)
+            if auth_token != server_token:
+                logger.warning("Unauthorized GSI payload received: token mismatch")
                 self.send_response(401)
                 self.end_headers()
                 return

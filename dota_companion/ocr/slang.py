@@ -6,7 +6,7 @@ from Chinese (CN), South American Spanish (SA/PE), Southeast Asian (SEA), Englis
 from __future__ import annotations
 
 import re
-from typing import Dict, Tuple
+from typing import Dict
 
 # Common Dota 2 slang dictionary with translations / meanings into Russian
 DOTA_SLANG_DICT: Dict[str, str] = {
@@ -85,7 +85,6 @@ DOTA_SLANG_DICT: Dict[str, str] = {
     "dale": "давай / го",
     "vamos": "погнали / вперед",
     "tumbar torre": "сносить башню",
-    "mid diff": "разница в миде",
     "gg end": "заканчивайте, гг",
 
     # === English / International / SEA Dota 2 Slang ===
@@ -95,7 +94,7 @@ DOTA_SLANG_DICT: Dict[str, str] = {
     "bb": "байбек",
     "buyback": "байбек",
     "aegis": "Аегис",
-    "mid diff": "разница на миде",
+    "mid diff": "разница на миде / в миде (мид диф)",
     "carry diff": "разница в керри",
     "space created": "создал спейс (пространство для фарма)",
     "pos 1": "1-я позиция (керри)",
