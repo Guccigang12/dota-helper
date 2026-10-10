@@ -8,17 +8,21 @@ Key components:
      https://market.dota2.net/api/v2/prices/USD.json (or RUB.json).
    - Local JSON cache (prices_cache.json) with 6-hour TTL.
    - O(1) in-memory price lookup: {market_hash_name: float(price)}.
-2. Steam Community Inventory Client:
+2. FreeProxyProvider:
+   - Automatically loads live HTTPS proxies from Proxyscrape API:
+     https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&ssl=yes
+   - Used when direct Steam Community requests time out due to ISP blocking.
+3. Steam Community Inventory Client:
    - Fetches https://steamcommunity.com/inventory/{steam_id}/570/2?l=english&count=2000
-   - Realistic browser User-Agent & headers.
-   - HTTP/SOCKS5 proxy and Cloudflare Worker reverse-proxy support.
-   - Statuses: 200 (parse items), 403 (hidden), 429 (rate-limit backoff), network errors.
-3. Pricing & Filtering:
+   - Cloudflare Worker reverse-proxy support ({worker_url}/inventory/{steam_id}/570/2?l=english&count=2000).
+   - HTTP/SOCKS5 proxy and auto free proxy fallback.
+   - Statuses: 200 (parse items), 403 or empty (HIDDEN: [Скрыт]), 429 (rate-limit backoff).
+4. Pricing & Filtering:
    - Only counts tradable items (tradable == 1).
-   - Filters out items below min_item_price ($1.0 default).
-4. Queue & Caching:
+   - Filters out items below min_item_price ($0.5 default; items cheaper than $0.5 are excluded).
+5. Queue & Caching:
    - SQLite cache (inventory_cache.db, 12-hour TTL).
-   - Background worker with soft 1.5–2.0s delay between players.
+   - Background worker with 1.5s delay between requests.
    - Streaming on_player_evaluated callback per player.
 """
 
@@ -39,7 +43,7 @@ logger = logging.getLogger("DotaHelper.FreeEvaluator")
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "WebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0.0.0 Safari/537.36"
 )
 
@@ -48,8 +52,8 @@ DEFAULT_PRICE_CACHE_PATH = Path("prices_cache.json")
 DEFAULT_PRICE_CACHE_TTL_HOURS = 6.0
 DEFAULT_INVENTORY_CACHE_DB = Path("inventory_cache.db")
 DEFAULT_INVENTORY_CACHE_TTL_HOURS = 12.0
-DEFAULT_MIN_ITEM_PRICE = 1.0
-DEFAULT_RATE_LIMIT_DELAY = 1.8
+DEFAULT_MIN_ITEM_PRICE = 0.5  # Items cheaper than $0.5 are excluded
+DEFAULT_REQUEST_INTERVAL_SECONDS = 1.5
 
 
 def normalize_steam_id64(steam_id: str | int) -> str:
@@ -65,8 +69,8 @@ def normalize_steam_id64(steam_id: str | int) -> str:
 
 def build_inventory_url(steam_id: str, custom_url: str = "") -> str:
     """
-    Construct Steam Community inventory URL or custom reverse-proxy URL.
-    Supports Cloudflare Worker endpoints or direct templates.
+    Construct Steam Community inventory URL or Cloudflare Worker endpoint:
+    {worker_url}/inventory/{steam_id}/570/2?l=english&count=2000
     """
     sid64 = normalize_steam_id64(steam_id)
     if not custom_url or not custom_url.strip():
@@ -267,11 +271,76 @@ class DotaPriceManager:
             logger.error("Failed to write %s: %s", self.cache_path.name, e)
 
 
-class FreeEvaluator:
+class FreeProxyProvider:
     """
-    Completely free Steam inventory evaluator without API keys or paid subscriptions.
+    Fetches and rotates free live HTTPS proxies from Proxyscrape API.
+    Used when direct Steam Community requests time out due to ISP blocks.
+    """
+
+    PROXYSCRAPE_URL = (
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&ssl=yes"
+    )
+
+    def __init__(self, ttl_seconds: float = 600.0) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._proxies: List[str] = []
+        self._last_fetched: float = 0.0
+        self._current_idx: int = 0
+        self._lock = threading.Lock()
+
+    def fetch_proxies(self, force: bool = False) -> List[str]:
+        with self._lock:
+            now = time.time()
+            if not force and self._proxies and (now - self._last_fetched < self.ttl_seconds):
+                return list(self._proxies)
+
+            try:
+                logger.info("Fetching free proxy list from Proxyscrape...")
+                resp = requests.get(self.PROXYSCRAPE_URL, timeout=8.0)
+                if resp.ok:
+                    lines = [line.strip() for line in resp.text.splitlines() if line.strip()]
+                    if lines:
+                        self._proxies = lines
+                        self._last_fetched = now
+                        self._current_idx = 0
+                        logger.info("Fetched %d free proxies from Proxyscrape.", len(lines))
+                        return list(self._proxies)
+            except Exception as e:
+                logger.warning("Failed to fetch proxies from Proxyscrape: %s", e)
+
+            return list(self._proxies)
+
+    def get_next_proxy(self) -> Optional[str]:
+        with self._lock:
+            if not self._proxies or (time.time() - self._last_fetched > self.ttl_seconds):
+                # Fetch in locked scope without deadlock
+                pass
+
+        if not self._proxies or (time.time() - self._last_fetched > self.ttl_seconds):
+            self.fetch_proxies(force=True)
+
+        with self._lock:
+            if not self._proxies:
+                return None
+            proxy = self._proxies[self._current_idx % len(self._proxies)]
+            self._current_idx += 1
+            if not (proxy.startswith("http://") or proxy.startswith("https://")):
+                return f"http://{proxy}"
+            return proxy
+
+
+class FreeInventoryEvaluator:
+    """
+    100% Free Steam inventory evaluator without API keys or paid subscriptions.
     Evaluates player inventories using Market Dota 2 price database and Steam Community API.
-    Features SQLite 12-hour caching, queue rate-limiting, and proxy support.
+    Features:
+    - 6-hour prices dump cache (prices_cache.json).
+    - SQLite 12-hour inventory cache (inventory_cache.db).
+    - Queue with 1.5s rate-limiting delay.
+    - Cloudflare Worker and HTTP/SOCKS5 proxy support.
+    - Automatic free proxy fallback via Proxyscrape API.
+    - Tradable items filtering and threshold >= $0.5.
+    - HTTP 403 / empty inventory -> status [Скрыт].
     """
 
     def __init__(
@@ -279,18 +348,24 @@ class FreeEvaluator:
         currency: str = "USD",
         min_item_price: float = DEFAULT_MIN_ITEM_PRICE,
         cache_ttl_hours: float = DEFAULT_INVENTORY_CACHE_TTL_HOURS,
-        rate_limit_delay: float = DEFAULT_RATE_LIMIT_DELAY,
-        proxy: str = "",
-        reverse_proxy_url: str = "",
+        request_interval_seconds: float = DEFAULT_REQUEST_INTERVAL_SECONDS,
+        proxy_url: str = "",
+        cloudflare_worker_url: str = "",
+        use_auto_free_proxies: bool = True,
         db_path: Path = DEFAULT_INVENTORY_CACHE_DB,
         prices_cache_path: Path = DEFAULT_PRICE_CACHE_PATH,
+        # Backward-compatibility kwargs:
+        proxy: str = "",
+        reverse_proxy_url: str = "",
+        rate_limit_delay: Optional[float] = None,
     ) -> None:
         self.currency = currency.upper().strip() or "USD"
         self.min_item_price = float(min_item_price)
         self.cache_ttl_seconds = cache_ttl_hours * 3600.0
-        self.rate_limit_delay = float(rate_limit_delay)
-        self.proxy = proxy.strip()
-        self.reverse_proxy_url = reverse_proxy_url.strip()
+        self.request_interval_seconds = float(rate_limit_delay if rate_limit_delay is not None else request_interval_seconds)
+        self.proxy_url = (proxy_url or proxy).strip()
+        self.cloudflare_worker_url = (cloudflare_worker_url or reverse_proxy_url).strip()
+        self.use_auto_free_proxies = bool(use_auto_free_proxies)
         self.db_path = db_path
 
         # Price database manager
@@ -298,6 +373,9 @@ class FreeEvaluator:
             currency=self.currency,
             cache_path=prices_cache_path,
         )
+
+        # Free proxy provider
+        self.proxy_provider = FreeProxyProvider()
 
         self._queue: queue.Queue[str] = queue.Queue()
         self._in_queue_set: set[str] = set()
@@ -312,10 +390,40 @@ class FreeEvaluator:
 
         self._init_database()
 
+    # Aliases for backward compatibility
+    @property
+    def proxy(self) -> str:
+        return self.proxy_url
+
+    @proxy.setter
+    def proxy(self, val: str) -> None:
+        self.proxy_url = val.strip()
+
+    @property
+    def reverse_proxy_url(self) -> str:
+        return self.cloudflare_worker_url
+
+    @reverse_proxy_url.setter
+    def reverse_proxy_url(self, val: str) -> None:
+        self.cloudflare_worker_url = val.strip()
+
+    @property
+    def rate_limit_delay(self) -> float:
+        return self.request_interval_seconds
+
+    @rate_limit_delay.setter
+    def rate_limit_delay(self, val: float) -> None:
+        self.request_interval_seconds = float(val)
+
     def update_settings(
         self,
         currency: Optional[str] = None,
         min_item_price: Optional[float] = None,
+        proxy_url: Optional[str] = None,
+        cloudflare_worker_url: Optional[str] = None,
+        use_auto_free_proxies: Optional[bool] = None,
+        request_interval_seconds: Optional[float] = None,
+        # backward compatibility:
         proxy: Optional[str] = None,
         reverse_proxy_url: Optional[str] = None,
         rate_limit_delay: Optional[float] = None,
@@ -329,26 +437,37 @@ class FreeEvaluator:
                     self.price_manager.set_currency(new_curr)
             if min_item_price is not None:
                 self.min_item_price = float(min_item_price)
-            if proxy is not None:
-                self.proxy = proxy.strip()
-            if reverse_proxy_url is not None:
-                self.reverse_proxy_url = reverse_proxy_url.strip()
-            if rate_limit_delay is not None:
-                self.rate_limit_delay = float(rate_limit_delay)
+            if proxy_url is not None:
+                self.proxy_url = proxy_url.strip()
+            elif proxy is not None:
+                self.proxy_url = proxy.strip()
+            if cloudflare_worker_url is not None:
+                self.cloudflare_worker_url = cloudflare_worker_url.strip()
+            elif reverse_proxy_url is not None:
+                self.cloudflare_worker_url = reverse_proxy_url.strip()
+            if use_auto_free_proxies is not None:
+                self.use_auto_free_proxies = bool(use_auto_free_proxies)
+            if request_interval_seconds is not None:
+                self.request_interval_seconds = float(request_interval_seconds)
+            elif rate_limit_delay is not None:
+                self.request_interval_seconds = float(rate_limit_delay)
+
             logger.info(
-                "Updated FreeEvaluator settings: currency=%s, min_item_price=%.2f, proxy=%s",
+                "Updated FreeInventoryEvaluator settings: currency=%s, min_item_price=%.2f, proxy=%s, worker=%s, auto_proxies=%s",
                 self.currency,
                 self.min_item_price,
-                self.proxy or "none",
+                self.proxy_url or "none",
+                self.cloudflare_worker_url or "none",
+                self.use_auto_free_proxies,
             )
 
     def set_api_token(self, _token: str) -> None:
-        """Kept for backward compatibility with main.py/overlay."""
+        """Compatibility dummy."""
         pass
 
     @property
     def api_token(self) -> str:
-        """Backward compatibility dummy."""
+        """Compatibility dummy."""
         return "FREE_NO_TOKEN_REQUIRED"
 
     @api_token.setter
@@ -375,7 +494,6 @@ class FreeEvaluator:
                     )
                     """
                 )
-                # Safely add any missing columns to existing database
                 cursor.execute("PRAGMA table_info(inventory_cache)")
                 existing_cols = {col[1] for col in cursor.fetchall()}
                 if "currency" not in existing_cols:
@@ -463,7 +581,6 @@ class FreeEvaluator:
         if self._running:
             return
 
-        # Pre-load prices in background thread so GUI is never blocked
         def _init_prices() -> None:
             self.price_manager.load_prices()
 
@@ -476,7 +593,7 @@ class FreeEvaluator:
             daemon=True,
         )
         self._worker_thread.start()
-        logger.info("FreeEvaluator background queue worker started.")
+        logger.info("FreeInventoryEvaluator background queue worker started.")
 
     def stop(self) -> None:
         """Stop background worker cleanly."""
@@ -485,13 +602,13 @@ class FreeEvaluator:
             self._queue.put("__STOP__")
             self._worker_thread.join(timeout=2.5)
             self._worker_thread = None
-        logger.info("FreeEvaluator stopped.")
+        logger.info("FreeInventoryEvaluator stopped.")
 
     def evaluate_players(self, steam_ids: List[str]) -> None:
         """
         Evaluate a list of player SteamIDs (e.g. 9 lobby players).
         Cached entries fire the callback immediately.
-        Uncached entries are queued and processed with soft rate-limiting (1.5-2.0s).
+        Uncached entries are queued and processed with soft rate-limiting (1.5s).
         """
         for raw_sid in steam_ids:
             if not raw_sid:
@@ -551,13 +668,13 @@ class FreeEvaluator:
                 if not self.price_manager.total_cached_items:
                     self.price_manager.load_prices()
 
-                # Soft rate-limiting delay between requests (1.5 - 2.0s)
+                # Rate-limiting delay between requests (default 1.5s)
                 elapsed = time.time() - self._last_request_time
-                if elapsed < self.rate_limit_delay:
-                    time.sleep(self.rate_limit_delay - elapsed)
+                if elapsed < self.request_interval_seconds:
+                    time.sleep(self.request_interval_seconds - elapsed)
 
                 # Configure proxies dynamically per request
-                proxies = normalize_proxy_dict(self.proxy)
+                proxies = normalize_proxy_dict(self.proxy_url)
                 session.proxies = proxies if proxies else {}
 
                 # Execute inventory fetch & price calculation
@@ -574,7 +691,7 @@ class FreeEvaluator:
                     self._queue.put(sid64)
                     continue
 
-                # Save successful and private responses to SQLite cache
+                # Save successful and hidden responses to SQLite cache
                 if result.status in ("OK", "HIDDEN"):
                     self.save_cached_result(result)
 
@@ -586,7 +703,7 @@ class FreeEvaluator:
                         logger.error("Error in on_player_evaluated callback: %s", e)
 
             except Exception as e:
-                logger.error("Unexpected error in FreeEvaluator worker for %s: %s", sid64, e)
+                logger.error("Unexpected error in FreeInventoryEvaluator worker for %s: %s", sid64, e)
             finally:
                 with self._lock:
                     self._in_queue_set.discard(sid64)
@@ -597,16 +714,48 @@ class FreeEvaluator:
         session: requests.Session,
         steam_id: str,
     ) -> InventoryValueResult:
-        """Fetch Steam Community inventory, parse items and calculate total value."""
+        """
+        Fetch Steam Community inventory, parse items and calculate total value.
+        Supports Cloudflare Worker, custom proxy, and auto-fallback to Proxyscrape proxies.
+        """
         target_url = build_inventory_url(
             steam_id=steam_id,
-            custom_url=self.reverse_proxy_url or (self.proxy if "workers.dev" in self.proxy else ""),
+            custom_url=self.cloudflare_worker_url or (self.proxy_url if "workers.dev" in self.proxy_url else ""),
         )
 
+        response = None
+        # Attempt 1: Direct or configured proxy
         try:
             logger.info("Fetching Steam inventory for %s from %s", steam_id, target_url)
             response = session.get(target_url, timeout=12.0)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            logger.warning("Steam request failed for %s (%s).", steam_id, exc)
+            if self.use_auto_free_proxies:
+                # Try fallback via auto free proxies from Proxyscrape
+                for attempt in range(2):
+                    free_proxy = self.proxy_provider.get_next_proxy()
+                    if not free_proxy:
+                        break
+                    logger.info("Retrying %s via free proxy: %s (attempt %d)...", steam_id, free_proxy, attempt + 1)
+                    try:
+                        temp_proxies = {"http": free_proxy, "https": free_proxy}
+                        response = session.get(target_url, proxies=temp_proxies, timeout=8.0)
+                        if response and response.ok:
+                            logger.info("Success using free proxy %s for %s!", free_proxy, steam_id)
+                            break
+                    except Exception:
+                        continue
 
+        if response is None:
+            return InventoryValueResult(
+                steam_id=steam_id,
+                value_usd=None,
+                status="ERROR",
+                error_message="Таймаут Steam (укажите прокси или worker)",
+                currency=self.currency,
+            )
+
+        try:
             # 1. Rate-limiting check
             if response.status_code == 429:
                 return InventoryValueResult(
@@ -617,7 +766,7 @@ class FreeEvaluator:
                     currency=self.currency,
                 )
 
-            # 2. Privacy check: 403 Forbidden is the standard Steam response for private inventories
+            # 2. Privacy check: 403 Forbidden -> status [Скрыт]
             if response.status_code == 403:
                 return InventoryValueResult(
                     steam_id=steam_id,
@@ -678,12 +827,12 @@ class FreeEvaluator:
             assets = data.get("assets") or []
             descriptions = data.get("descriptions") or []
 
+            # Empty inventory -> status [Скрыт]
             if not assets:
-                # Public inventory, but 0 items
                 return InventoryValueResult(
                     steam_id=steam_id,
                     value_usd=0.0,
-                    status="OK",
+                    status="HIDDEN",
                     currency=self.currency,
                     items_count=0,
                     valued_items_count=0,
@@ -727,7 +876,7 @@ class FreeEvaluator:
 
                 price = self.price_manager.get_price(market_hash_name)
 
-                # Skip items below minimum price threshold (e.g. $1.0)
+                # Skip items below minimum price threshold ($0.5 default)
                 if price < self.min_item_price:
                     continue
 
@@ -767,26 +916,18 @@ class FreeEvaluator:
                 top_items=top_items[:10],
             )
 
-        except requests.exceptions.Timeout:
-            logger.warning("Steam inventory request timed out for %s (check proxy / connection)", steam_id)
+        except Exception as e:
+            logger.error("Error evaluating inventory for %s: %s", steam_id, e)
             return InventoryValueResult(
                 steam_id=steam_id,
                 value_usd=None,
                 status="ERROR",
-                error_message="Таймаут Steam (укажите прокси)",
-                currency=self.currency,
-            )
-        except requests.exceptions.RequestException as e:
-            logger.error("Network error evaluating inventory for %s: %s", steam_id, e)
-            return InventoryValueResult(
-                steam_id=steam_id,
-                value_usd=None,
-                status="ERROR",
-                error_message="Ошибка сети Steam",
+                error_message=f"Ошибка обработки: {e}",
                 currency=self.currency,
             )
 
 
 # Backward compatibility aliases
-LZTEvaluator = FreeEvaluator
-InventoryEvaluator = FreeEvaluator
+FreeEvaluator = FreeInventoryEvaluator
+InventoryEvaluator = FreeInventoryEvaluator
+LZTEvaluator = FreeInventoryEvaluator

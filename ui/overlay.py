@@ -233,13 +233,17 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(QLabel("Мин. цена предмета (вещи дешевле не учитываются):"))
         self.input_min_price = QLineEdit()
-        self.input_min_price.setPlaceholderText("1.0 (для USD) или 90.0 (для RUB)")
+        self.input_min_price.setPlaceholderText("0.5 (для USD) или 45.0 (для RUB)")
         layout.addWidget(self.input_min_price)
 
-        layout.addWidget(QLabel("Прокси Steam (HTTP/SOCKS5 или Cloudflare Worker):"))
+        layout.addWidget(QLabel("Прокси / Cloudflare Worker (опционально):"))
         self.input_proxy = QLineEdit()
-        self.input_proxy.setPlaceholderText("http://127.0.0.1:10808 или socks5://... (опционально)")
+        self.input_proxy.setPlaceholderText("http://127.0.0.1:10808 или https://worker.workers.dev (опционально)")
         layout.addWidget(self.input_proxy)
+
+        self.check_auto_proxies = QCheckBox("Автоматически использовать бесплатные прокси при блокировке")
+        self.check_auto_proxies.setStyleSheet("color: #b0b8cb; font-size: 12px;")
+        layout.addWidget(self.check_auto_proxies)
 
         # OpenRouter Key
         layout.addWidget(QLabel("OpenRouter API Key (для Vision-перевода чата):"))
@@ -273,13 +277,20 @@ class SettingsDialog(QDialog):
             return
         try:
             cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
-            pricing_cfg = cfg.get("pricing", {})
-            curr = pricing_cfg.get("currency", "USD").upper()
+            checker_cfg = cfg.get("inventory_checker", cfg.get("pricing", {}))
+            curr = checker_cfg.get("currency", "USD").upper()
             idx = self.combo_currency.findText(curr)
             if idx >= 0:
                 self.combo_currency.setCurrentIndex(idx)
-            self.input_min_price.setText(str(pricing_cfg.get("min_item_price", 1.0)))
-            self.input_proxy.setText(pricing_cfg.get("proxy", "") or pricing_cfg.get("reverse_proxy_url", ""))
+            self.input_min_price.setText(str(checker_cfg.get("min_item_price", 0.5)))
+            proxy_val = (
+                checker_cfg.get("cloudflare_worker_url", "")
+                or checker_cfg.get("proxy_url", "")
+                or checker_cfg.get("proxy", "")
+                or checker_cfg.get("reverse_proxy_url", "")
+            )
+            self.input_proxy.setText(proxy_val)
+            self.check_auto_proxies.setChecked(bool(checker_cfg.get("use_auto_free_proxies", True)))
             self.input_openrouter.setText(cfg.get("openrouter", {}).get("api_key", ""))
             self.input_model.setText(cfg.get("openrouter", {}).get("model", "google/gemini-2.5-flash"))
             self.input_gsi.setText(cfg.get("gsi", {}).get("auth_token", "DOTAHELPER_GSI_SECRET_KEY"))
@@ -292,29 +303,30 @@ class SettingsDialog(QDialog):
             if self.config_path.exists():
                 cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
 
-            if "pricing" not in cfg:
-                cfg["pricing"] = {}
-            cfg["pricing"]["currency"] = self.combo_currency.currentText()
+            if "inventory_checker" not in cfg:
+                cfg["inventory_checker"] = {}
+            cfg["inventory_checker"]["currency"] = self.combo_currency.currentText()
             try:
-                cfg["pricing"]["min_item_price"] = float(self.input_min_price.text().strip() or "1.0")
+                cfg["inventory_checker"]["min_item_price"] = float(self.input_min_price.text().strip() or "0.5")
             except ValueError:
-                cfg["pricing"]["min_item_price"] = 1.0
+                cfg["inventory_checker"]["min_item_price"] = 0.5
 
             proxy_val = self.input_proxy.text().strip()
             if "workers.dev" in proxy_val or "/inventory" in proxy_val:
-                cfg["pricing"]["reverse_proxy_url"] = proxy_val
-                cfg["pricing"]["proxy"] = ""
+                cfg["inventory_checker"]["cloudflare_worker_url"] = proxy_val
+                cfg["inventory_checker"]["proxy_url"] = ""
             else:
-                cfg["pricing"]["proxy"] = proxy_val
-                if "reverse_proxy_url" not in cfg["pricing"]:
-                    cfg["pricing"]["reverse_proxy_url"] = ""
+                cfg["inventory_checker"]["proxy_url"] = proxy_val
+                cfg["inventory_checker"]["cloudflare_worker_url"] = ""
 
-            if "cache_ttl_hours" not in cfg["pricing"]:
-                cfg["pricing"]["cache_ttl_hours"] = 12
-            if "rate_limit_delay" not in cfg["pricing"]:
-                cfg["pricing"]["rate_limit_delay"] = 1.8
+            cfg["inventory_checker"]["use_auto_free_proxies"] = self.check_auto_proxies.isChecked()
+            if "cache_ttl_hours" not in cfg["inventory_checker"]:
+                cfg["inventory_checker"]["cache_ttl_hours"] = 12
+            if "request_interval_seconds" not in cfg["inventory_checker"]:
+                cfg["inventory_checker"]["request_interval_seconds"] = 1.5
 
             cfg.pop("lzt", None)
+            cfg.pop("pricing", None)
 
             if "openrouter" not in cfg:
                 cfg["openrouter"] = {}

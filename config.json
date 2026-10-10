@@ -10,13 +10,14 @@
     "site_url": "https://github.com/dotahelper",
     "site_name": "DotaHelper"
   },
-  "pricing": {
-    "currency": "USD",
-    "min_item_price": 1.0,
+  "inventory_checker": {
+    "proxy_url": "",
+    "cloudflare_worker_url": "",
+    "use_auto_free_proxies": true,
     "cache_ttl_hours": 12,
-    "rate_limit_delay": 1.8,
-    "proxy": "",
-    "reverse_proxy_url": ""
+    "request_interval_seconds": 1.5,
+    "min_item_price": 0.5,
+    "currency": "USD"
   },
   "chat_vision": {
     "roi": {

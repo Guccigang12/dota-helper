@@ -34,9 +34,8 @@ DotaHelper/
 ├── core/                           # Модули DotaHelper
 │   ├── gsi_server.py               # Локальный HTTP GSI-сервер + автогенерация CFG
 │   ├── steam_coplay.py             # Steamworks SDK (определение 9 игроков лобби)
-│   ├── free_evaluator.py           # БЕСПЛАТНАЯ оценка инвентарей (Market Dota 2 дамп, кэш SQLite 12ч)
-│   ├── lzt_evaluator.py            # Модуль обратной совместимости (алиас на FreeEvaluator)
-│   ├── chat_translator.py          # Vision-переводчик чата через OpenRouter API
+│   ├── free_evaluator.py           # БЕСПЛАТНАЯ оценка инвентарей (Market Dota 2 дамп, кэш SQLite 12ч, фильтр <$0.5, авто-прокси)
+│   ├── chat_translator.py          # Vision-переводчик чата через OpenRouter API (с DPI масштабированием)
 │   └── soundpad.py                 # Простой контроллер воспроизведения звуков
 │
 ├── ui/                             # Интерфейс DotaHelper
@@ -95,8 +94,8 @@ python main.py --companion
 - **Источник цен**: актуальный публичный дамп цен Market Dota 2 (`https://market.dota2.net/api/v2/prices/USD.json` или `RUB.json`).
 - **Кэш цен**: `prices_cache.json` обновляется не чаще одного раза в 6 часов.
 - **Кэш инвентарей**: локальная SQLite-база `inventory_cache.db` хранит инвентари игроков 12 часов.
-- **Фильтрация ширпотреба**: предметы дешевле `$1.0` (или эквивалента в рублях) автоматически отфильтровываются из итоговой суммы.
-- **Обход блокировок**: поддержка SOCKS5/HTTP прокси (`pricing.proxy`) и реверс-прокси Cloudflare Worker (`pricing.reverse_proxy_url`).
+- **Фильтрация ширпотреба**: предметы дешевле `$0.5` автоматически отфильтровываются из итоговой суммы инвентаря.
+- **Обход блокировок**: поддержка SOCKS5/HTTP прокси, реверс-прокси Cloudflare Worker (`{worker_url}/inventory/{steam_id}/...`) и автоматической подгрузки живых HTTPS-прокси через Proxyscrape API.
 
 #### Хоткеи по умолчанию
 

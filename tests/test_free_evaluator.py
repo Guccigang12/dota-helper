@@ -7,17 +7,19 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from core.free_evaluator import (
+    FreeInventoryEvaluator,
     FreeEvaluator,
     DotaPriceManager,
+    FreeProxyProvider,
     InventoryValueResult,
     normalize_steam_id64,
     build_inventory_url,
     normalize_proxy_dict,
 )
-from core.lzt_evaluator import LZTEvaluator
+from core.chat_translator import get_screen_dpi_scale
 
 
-class TestFreeEvaluator(unittest.TestCase):
+class TestFreeInventoryEvaluator(unittest.TestCase):
     def test_steam_id_normalization(self):
         # 64-bit ID stays untouched
         self.assertEqual(normalize_steam_id64("76561198012345678"), "76561198012345678")
@@ -66,7 +68,7 @@ class TestFreeEvaluator(unittest.TestCase):
         self.assertGreater(pm.get_price("Dragonclaw Hook"), 50.0)
         self.assertEqual(pm.get_price("NonExistentItem12345"), 0.0)
 
-    def test_inventory_calculation_and_filtering(self):
+    def test_inventory_calculation_and_05_dollar_filter(self):
         db_path = Path("test_inv_cache.db")
         if db_path.exists():
             try:
@@ -74,32 +76,35 @@ class TestFreeEvaluator(unittest.TestCase):
             except Exception:
                 pass
 
-        evaluator = FreeEvaluator(
+        evaluator = FreeInventoryEvaluator(
             currency="USD",
-            min_item_price=1.0,
+            min_item_price=0.5,
             db_path=db_path,
         )
         evaluator.price_manager._prices = {
             "Expensive Hook": 250.0,
             "Arcana Blade": 20.0,
-            "Cheap Item": 0.50,
-            "Trash Item": 0.05,
+            "Half Dollar Item": 0.50,
+            "Cheap Trash": 0.20,
+            "Pennies Trash": 0.03,
         }
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.ok = True
         mock_response.json.return_value = {
             "assets": [
-                {"classid": "1", "instanceid": "0", "amount": "1"},
-                {"classid": "2", "instanceid": "0", "amount": "2"},
-                {"classid": "3", "instanceid": "0", "amount": "5"},  # cheap (<1.0)
-                {"classid": "4", "instanceid": "0", "amount": "1"},  # non-tradable
+                {"classid": "1", "instanceid": "0", "amount": "1"},  # 250.0
+                {"classid": "2", "instanceid": "0", "amount": "2"},  # 20.0 * 2 = 40.0
+                {"classid": "3", "instanceid": "0", "amount": "4"},  # 0.50 * 4 = 2.0 (>= 0.50, included)
+                {"classid": "4", "instanceid": "0", "amount": "10"}, # 0.20 * 10 (< 0.50, excluded)
+                {"classid": "5", "instanceid": "0", "amount": "1"},  # non-tradable
             ],
             "descriptions": [
                 {"classid": "1", "instanceid": "0", "market_hash_name": "Expensive Hook", "tradable": 1},
                 {"classid": "2", "instanceid": "0", "market_hash_name": "Arcana Blade", "tradable": 1},
-                {"classid": "3", "instanceid": "0", "market_hash_name": "Cheap Item", "tradable": 1},
-                {"classid": "4", "instanceid": "0", "market_hash_name": "Expensive Hook", "tradable": 0},
+                {"classid": "3", "instanceid": "0", "market_hash_name": "Half Dollar Item", "tradable": 1},
+                {"classid": "4", "instanceid": "0", "market_hash_name": "Cheap Trash", "tradable": 1},
+                {"classid": "5", "instanceid": "0", "market_hash_name": "Expensive Hook", "tradable": 0},
             ],
         }
         session = MagicMock()
@@ -107,20 +112,21 @@ class TestFreeEvaluator(unittest.TestCase):
 
         res = evaluator._fetch_and_calculate_inventory(session, "76561198000000001")
         self.assertEqual(res.status, "OK")
-        # 250*1 + 20*2 = 290.0 (Cheap Item $0.50 and untradable Hook are ignored)
-        self.assertEqual(res.value_usd, 290.0)
-        self.assertEqual(res.valued_items_count, 3)
-        self.assertEqual(res.items_count, 4)
+        # 250*1 + 20*2 + 0.50*4 = 292.0
+        # Items with price < 0.5 ($0.20 Cheap Trash) and non-tradable Hook are ignored
+        self.assertEqual(res.value_usd, 292.0)
+        self.assertEqual(res.valued_items_count, 1 + 2 + 4)
+        self.assertEqual(res.items_count, 5)
 
         # Cache saving and retrieval test
         evaluator.save_cached_result(res)
         cached = evaluator.get_cached_result("76561198000000001")
         self.assertIsNotNone(cached)
         self.assertEqual(cached.status, "CACHED")
-        self.assertEqual(cached.value_usd, 290.0)
+        self.assertEqual(cached.value_usd, 292.0)
         self.assertTrue(cached.cached)
 
-        # 403 privacy test
+        # 403 privacy test -> [Скрыт]
         mock_403 = MagicMock()
         mock_403.status_code = 403
         mock_403.ok = False
@@ -129,6 +135,16 @@ class TestFreeEvaluator(unittest.TestCase):
         self.assertEqual(res_403.status, "HIDDEN")
         self.assertEqual(res_403.display_text, "[Скрыт]")
 
+        # Empty inventory test -> [Скрыт]
+        mock_empty = MagicMock()
+        mock_empty.status_code = 200
+        mock_empty.ok = True
+        mock_empty.json.return_value = {"assets": [], "descriptions": []}
+        session.get.return_value = mock_empty
+        res_empty = evaluator._fetch_and_calculate_inventory(session, "76561198000000003")
+        self.assertEqual(res_empty.status, "HIDDEN")
+        self.assertEqual(res_empty.display_text, "[Скрыт]")
+
         del evaluator
         gc.collect()
         if db_path.exists():
@@ -136,6 +152,16 @@ class TestFreeEvaluator(unittest.TestCase):
                 os.remove(db_path)
             except Exception:
                 pass
+
+    def test_free_proxy_provider(self):
+        provider = FreeProxyProvider()
+        self.assertTrue(hasattr(provider, "get_next_proxy"))
+        self.assertTrue(hasattr(provider, "fetch_proxies"))
+
+    def test_dpi_scaling_helper(self):
+        scale = get_screen_dpi_scale()
+        self.assertIsInstance(scale, float)
+        self.assertGreater(scale, 0.0)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,38 @@ class TranslatedMessage:
             self.timestamp = time.time()
 
 
+def get_screen_dpi_scale() -> float:
+    """
+    Returns Windows screen DPI scaling factor (e.g. 1.0 for 100%, 1.25 for 125%, 1.5 for 150%, 2.0 for 200%).
+    Checks PyQt6 primaryScreen().devicePixelRatio() first, then Windows user32.GetDpiForSystem(), defaulting to 1.0.
+    """
+    # 1. Check Qt devicePixelRatio
+    try:
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app:
+            screen = app.primaryScreen()
+            if screen:
+                dpr = screen.devicePixelRatio()
+                if dpr and dpr > 0:
+                    return float(dpr)
+    except Exception:
+        pass
+
+    # 2. Check Windows user32.GetDpiForSystem
+    try:
+        import ctypes
+        if hasattr(ctypes, "windll") and hasattr(ctypes.windll, "user32"):
+            if hasattr(ctypes.windll.user32, "GetDpiForSystem"):
+                dpi = ctypes.windll.user32.GetDpiForSystem()
+                if dpi > 0:
+                    return float(dpi) / 96.0
+    except Exception:
+        pass
+
+    return 1.0
+
+
 class ChatVisionTranslator:
     """
     Vision-based chat translator using OpenRouter Multimodal API.
@@ -155,8 +187,15 @@ class ChatVisionTranslator:
             if self.on_status_change:
                 self.on_status_change("📸 Захват области экрана...")
 
-            # 1. Capture screen ROI
-            bbox = (self.roi["left"], self.roi["top"], self.roi["right"], self.roi["bottom"])
+            # 1. Capture screen ROI adjusted for Windows DPI scaling (>100%, 125%, 150%, 4K)
+            scale = get_screen_dpi_scale()
+            bbox = (
+                int(round(self.roi["left"] * scale)),
+                int(round(self.roi["top"] * scale)),
+                int(round(self.roi["right"] * scale)),
+                int(round(self.roi["bottom"] * scale)),
+            )
+            logger.info("Capturing chat screen ROI: %s (scale: %.2f, logical ROI: %s)", bbox, scale, self.roi)
             try:
                 img = ImageGrab.grab(bbox=bbox, all_screens=True)
             except Exception as e:

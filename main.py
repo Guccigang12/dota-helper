@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import QApplication
 
 from core.gsi_server import GSIServer, install_gsi_config
 from core.steam_coplay import SteamCoplayManager
-from core.free_evaluator import FreeEvaluator, LZTEvaluator
+from core.free_evaluator import FreeInventoryEvaluator, InventoryValueResult
 from core.chat_translator import ChatVisionTranslator
 from core.soundpad import SoundpadManager
 from ui.overlay import OverlayWindow
@@ -44,13 +44,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "site_url": "https://github.com/dotahelper",
         "site_name": "DotaHelper",
     },
-    "pricing": {
-        "currency": "USD",
-        "min_item_price": 1.0,
+    "inventory_checker": {
+        "proxy_url": "",
+        "cloudflare_worker_url": "",
+        "use_auto_free_proxies": True,
         "cache_ttl_hours": 12,
-        "rate_limit_delay": 1.8,
-        "proxy": "",
-        "reverse_proxy_url": "",
+        "request_interval_seconds": 1.5,
+        "min_item_price": 0.5,
+        "currency": "USD",
     },
     "chat_vision": {
         "roi": {
@@ -131,17 +132,17 @@ class DotaHelperApp:
         # 3. Setup Steamworks Coplay Manager
         self.coplay_manager = SteamCoplayManager()
 
-        # 4. Setup Free Inventory Evaluator
-        pricing_cfg = self.config.get("pricing", {})
-        self.inventory_evaluator = FreeEvaluator(
-            currency=pricing_cfg.get("currency", "USD"),
-            min_item_price=pricing_cfg.get("min_item_price", 1.0),
-            cache_ttl_hours=pricing_cfg.get("cache_ttl_hours", 12),
-            rate_limit_delay=pricing_cfg.get("rate_limit_delay", 1.8),
-            proxy=pricing_cfg.get("proxy", ""),
-            reverse_proxy_url=pricing_cfg.get("reverse_proxy_url", ""),
+        # 4. Setup Free Inventory Evaluator (100% Free, no paid APIs)
+        checker_cfg = self.config.get("inventory_checker", self.config.get("pricing", {}))
+        self.inventory_evaluator = FreeInventoryEvaluator(
+            currency=checker_cfg.get("currency", "USD"),
+            min_item_price=checker_cfg.get("min_item_price", 0.5),
+            cache_ttl_hours=checker_cfg.get("cache_ttl_hours", 12),
+            request_interval_seconds=checker_cfg.get("request_interval_seconds", 1.5),
+            proxy_url=checker_cfg.get("proxy_url", checker_cfg.get("proxy", "")),
+            cloudflare_worker_url=checker_cfg.get("cloudflare_worker_url", checker_cfg.get("reverse_proxy_url", "")),
+            use_auto_free_proxies=checker_cfg.get("use_auto_free_proxies", True),
         )
-        self.lzt_evaluator = self.inventory_evaluator
 
         # 5. Setup Chat Vision Translator
         or_cfg = self.config.get("openrouter", {})
@@ -175,11 +176,11 @@ class DotaHelperApp:
         self.gsi_server.on_hero_selection = self._handle_hero_selection
         self.gsi_server.on_post_game = self._handle_post_game
 
-        # Steam Coplay -> UI & LZT Evaluator
+        # Steam Coplay -> UI & Free Inventory Evaluator
         self.coplay_manager.on_lobby_detected = self._handle_lobby_detected
 
-        # LZT Evaluator -> UI
-        self.lzt_evaluator.on_player_evaluated = lambda res: self.overlay.signals.player_evaluated.emit(res)
+        # Free Inventory Evaluator -> UI
+        self.inventory_evaluator.on_player_evaluated = lambda res: self.overlay.signals.player_evaluated.emit(res)
 
         # Chat Vision Translator -> UI
         self.chat_translator.on_translation_success = lambda msgs: self.overlay.signals.chat_translated.emit(msgs)
@@ -227,20 +228,21 @@ class DotaHelperApp:
     def _on_settings_saved(self, cfg: Dict[str, Any]) -> None:
         """Apply new configuration dynamically without app restart."""
         self.config = cfg
-        pricing_cfg = cfg.get("pricing", {})
+        checker_cfg = cfg.get("inventory_checker", cfg.get("pricing", {}))
         new_or_key = cfg.get("openrouter", {}).get("api_key", "")
         new_model = cfg.get("openrouter", {}).get("model", "google/gemini-2.5-flash")
 
         self.inventory_evaluator.update_settings(
-            currency=pricing_cfg.get("currency", "USD"),
-            min_item_price=pricing_cfg.get("min_item_price", 1.0),
-            proxy=pricing_cfg.get("proxy", ""),
-            reverse_proxy_url=pricing_cfg.get("reverse_proxy_url", ""),
-            rate_limit_delay=pricing_cfg.get("rate_limit_delay", 1.8),
+            currency=checker_cfg.get("currency", "USD"),
+            min_item_price=checker_cfg.get("min_item_price", 0.5),
+            proxy_url=checker_cfg.get("proxy_url", checker_cfg.get("proxy", "")),
+            cloudflare_worker_url=checker_cfg.get("cloudflare_worker_url", checker_cfg.get("reverse_proxy_url", "")),
+            use_auto_free_proxies=checker_cfg.get("use_auto_free_proxies", True),
+            request_interval_seconds=checker_cfg.get("request_interval_seconds", 1.5),
         )
         self.chat_translator.set_api_key(new_or_key)
         self.chat_translator.set_model(new_model)
-        logger.info("Runtime pricing settings and model dynamically updated from Settings dialog.")
+        logger.info("Runtime inventory checker settings and model dynamically updated from Settings dialog.")
 
     def _bind_roi_selector(self) -> None:
         """Hook save_roi when ROI selector emits."""
