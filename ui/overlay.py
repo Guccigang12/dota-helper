@@ -241,15 +241,27 @@ class SettingsDialog(QDialog):
         self.check_auto_proxies.setStyleSheet("color: #b0b8cb; font-size: 12px;")
         layout.addWidget(self.check_auto_proxies)
 
+        # Groq AI Key & Model
+        layout.addWidget(QLabel("⚡ Groq API Key (AI-переводчик чата ~0.2с):"))
+        self.input_groq = QLineEdit()
+        self.input_groq.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input_groq.setPlaceholderText("gsk_...")
+        layout.addWidget(self.input_groq)
+
+        layout.addWidget(QLabel("Модель Groq (по умолчанию: qwen/qwen3.8-27b):"))
+        self.input_groq_model = QLineEdit()
+        self.input_groq_model.setPlaceholderText("qwen/qwen3.8-27b")
+        layout.addWidget(self.input_groq_model)
+
         # OpenRouter Key
-        layout.addWidget(QLabel("OpenRouter API Key (для Vision-перевода чата):"))
+        layout.addWidget(QLabel("OpenRouter API Key (опционально, для Vision):"))
         self.input_openrouter = QLineEdit()
         self.input_openrouter.setEchoMode(QLineEdit.EchoMode.Password)
         self.input_openrouter.setPlaceholderText("sk-or-v1-...")
         layout.addWidget(self.input_openrouter)
 
         # OpenRouter Model
-        layout.addWidget(QLabel("Модель нейросети OpenRouter (с поддержкой Vision):"))
+        layout.addWidget(QLabel("Модель OpenRouter (опционально):"))
         self.input_model = QLineEdit()
         self.input_model.setPlaceholderText("google/gemini-2.5-flash")
         layout.addWidget(self.input_model)
@@ -286,7 +298,8 @@ class SettingsDialog(QDialog):
                 or checker_cfg.get("reverse_proxy_url", "")
             )
             self.input_proxy.setText(proxy_val)
-            self.check_auto_proxies.setChecked(bool(checker_cfg.get("use_auto_free_proxies", True)))
+            self.input_groq.setText(cfg.get("groq", {}).get("api_key", "") or os.environ.get("GROQ_API_KEY", ""))
+            self.input_groq_model.setText(cfg.get("groq", {}).get("model", "qwen/qwen3.8-27b"))
             self.input_openrouter.setText(cfg.get("openrouter", {}).get("api_key", ""))
             self.input_model.setText(cfg.get("openrouter", {}).get("model", "google/gemini-2.5-flash"))
             self.input_gsi.setText(cfg.get("gsi", {}).get("auth_token", "DOTAHELPER_GSI_SECRET_KEY"))
@@ -323,6 +336,11 @@ class SettingsDialog(QDialog):
 
             cfg.pop("lzt", None)
             cfg.pop("pricing", None)
+
+            if "groq" not in cfg:
+                cfg["groq"] = {}
+            cfg["groq"]["api_key"] = self.input_groq.text().strip()
+            cfg["groq"]["model"] = self.input_groq_model.text().strip() or "qwen/qwen3.8-27b"
 
             if "openrouter" not in cfg:
                 cfg["openrouter"] = {}

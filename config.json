@@ -4,6 +4,10 @@
     "port": 32123,
     "auth_token": "DOTAHELPER_GSI_SECRET_KEY"
   },
+  "groq": {
+    "api_key": "",
+    "model": "qwen/qwen3.8-27b"
+  },
   "openrouter": {
     "api_key": "",
     "model": "google/gemini-2.5-flash",

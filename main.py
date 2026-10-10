@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -22,6 +23,25 @@ from core.free_evaluator import FreeInventoryEvaluator
 from core.chat_translator import ChatVisionTranslator
 from core.soundpad import SoundpadManager
 from ui.overlay import OverlayWindow
+
+
+def _load_env_file() -> None:
+    env_file = Path(".env")
+    if env_file.is_file():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip("\"'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+
+_load_env_file()
 
 # Configure logging
 logging.basicConfig(
@@ -37,6 +57,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "host": "127.0.0.1",
         "port": 32123,
         "auth_token": "DOTAHELPER_GSI_SECRET_KEY",
+    },
+    "groq": {
+        "api_key": "",
+        "model": "qwen/qwen3.8-27b",
     },
     "openrouter": {
         "api_key": "",
@@ -146,12 +170,30 @@ class DotaHelperApp:
             use_auto_free_proxies=checker_cfg.get("use_auto_free_proxies", True),
         )
 
-        # 5. Setup Chat Vision Translator
+        # 5. Setup AI Chat Translator (Groq / OpenRouter)
+        groq_cfg = self.config.get("groq", {})
         or_cfg = self.config.get("openrouter", {})
+
+        groq_key = groq_cfg.get("api_key", "").strip() or os.environ.get("GROQ_API_KEY", "").strip()
+        groq_model = groq_cfg.get("model", "qwen/qwen3.8-27b").strip()
+
+        or_key = or_cfg.get("api_key", "").strip()
+        or_model = or_cfg.get("model", "google/gemini-2.5-flash").strip()
+
+        if groq_key:
+            trans_provider = "groq"
+            trans_key = groq_key
+            trans_model = groq_model
+        else:
+            trans_provider = "openrouter" if or_key else "groq"
+            trans_key = or_key
+            trans_model = or_model if or_key else "qwen/qwen3.8-27b"
+
         self.chat_translator = ChatVisionTranslator(
-            api_key=or_cfg.get("api_key", ""),
-            model=or_cfg.get("model", "google/gemini-2.5-flash"),
-            config_path=CONFIG_FILE,
+            api_key=trans_key,
+            model=trans_model,
+            provider=trans_provider,
+            config_path=self.config_path,
         )
 
         # 6. Setup Soundpad Manager

@@ -14,6 +14,25 @@ APP_DIR_NAME = "DotaCompanion"
 SETTINGS_FILE = "settings.json"
 
 
+def _load_env_file() -> None:
+    env_file = Path(".env")
+    if env_file.is_file():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip("\"'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
+
+_load_env_file()
+
+
 def get_config_dir() -> Path:
     base = os.environ.get("APPDATA")
     if base:
@@ -62,7 +81,7 @@ class Settings:
     chat_region: ChatRegion = field(default_factory=ChatRegion)
 
     # Переводчик (общие настройки)
-    translator_provider: str = "gemini"
+    translator_provider: str = "groq"
     deepl_api_key: str = ""
     libretranslate_url: str = "https://libretranslate.com/translate"
     gemini_api_key: str = ""
@@ -75,8 +94,8 @@ class Settings:
     custom_api_key: str = ""
     custom_model: str = "qwen2.5:7b"
 
-    groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_api_key: str = field(default_factory=lambda: os.environ.get("GROQ_API_KEY", ""))
+    groq_model: str = "qwen/qwen3.8-27b"
 
     openrouter_api_key: str = ""
     openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"

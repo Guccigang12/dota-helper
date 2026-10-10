@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import os
 from typing import Literal
 
 import aiohttp
@@ -35,7 +36,7 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
 
 GROQ_BASE = "https://api.groq.com/openai/v1"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
 
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
@@ -59,7 +60,7 @@ class TranslationError(Exception):
 class Translator:
     def __init__(
         self,
-        provider: Provider = "google",
+        provider: Provider = "groq",
         deepl_api_key: str = "",
         libretranslate_url: str = "https://libretranslate.com/translate",
         source_lang: str = "auto",
@@ -89,7 +90,7 @@ class Translator:
         self.custom_api_key = custom_api_key
         self.custom_model = custom_model or DEFAULT_OLLAMA_MODEL
 
-        self.groq_api_key = groq_api_key
+        self.groq_api_key = groq_api_key or os.environ.get("GROQ_API_KEY", "")
         self.groq_model = groq_model or DEFAULT_GROQ_MODEL
 
         self.openrouter_api_key = openrouter_api_key
@@ -452,6 +453,9 @@ class Translator:
         elif "openrouter" in clean_url or "groq" in clean_url or "deepseek" in clean_url:
             raise TranslationError(f"Для сервиса {service_name} требуется API-ключ")
 
+        if "groq" in clean_url and (not model or model == "llama-3.3-70b-versatile"):
+            model = "qwen/qwen3.8-27b"
+
         payload = {
             "model": model,
             "messages": [
@@ -466,10 +470,19 @@ class Translator:
         }
 
         async with session.post(endpoint, headers=headers, json=payload) as resp:
-            if resp.status != 200:
+            if resp.status == 404 and "groq" in clean_url and model != "qwen/qwen3.8-27b":
+                log.info("Groq модель %s недоступна, переключаемся на qwen/qwen3.8-27b", model)
+                payload["model"] = "qwen/qwen3.8-27b"
+                async with session.post(endpoint, headers=headers, json=payload) as retry_resp:
+                    if retry_resp.status != 200:
+                        body = await retry_resp.text()
+                        raise TranslationError(f"{service_name} -> {retry_resp.status}: {body[:200]}")
+                    data = await retry_resp.json(content_type=None)
+            elif resp.status != 200:
                 body = await resp.text()
                 raise TranslationError(f"{service_name} -> {resp.status}: {body[:200]}")
-            data = await resp.json(content_type=None)
+            else:
+                data = await resp.json(content_type=None)
 
         choices = data.get("choices") or []
         if not choices:

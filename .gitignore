@@ -11,6 +11,9 @@ inventory_cache.db
 prices_cache.json
 *.db
 *.log
+.env
+*.env
+.env.*
 
 # Сборка
 build/

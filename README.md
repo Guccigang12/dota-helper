@@ -83,7 +83,7 @@ python main.py --companion
 #### Опционально: Tesseract и языковые пакеты
 Для использования Tesseract OCR в `dota_companion` (если не используется нативный Windows OCR):
 1. Скачайте инсталлятор [Tesseract OCR for Windows](https://github.com/UB-Mannheim/tesseract/wiki).
-2. При установке выберите языки: **Russian**, **Chinese Simplified** (`chi_sim`), **English**.
+2. При установке выберите языки: **Russian**, **English** (китайский язык обрабатывается через нативный Windows OCR или AI).
 3. Добавьте путь к `tesseract.exe` в системную переменную `PATH` или задайте `TESSERACT_PATH`.
 
 ---

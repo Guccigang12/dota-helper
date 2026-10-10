@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional
-from PIL import ImageGrab
+from PIL import Image, ImageGrab
 import requests
 
 logger = logging.getLogger("DotaHelper.ChatTranslator")
@@ -81,18 +81,26 @@ def get_screen_dpi_scale() -> float:
 
 class ChatVisionTranslator:
     """
-    Vision-based chat translator using OpenRouter Multimodal API.
+    AI-powered chat translator supporting Groq API (ultra-fast LLM translation via OCR)
+    and OpenRouter Multimodal Vision API.
     Handles screen capture of designated ROI, compression, anti-spam queuing, and translation.
     """
 
     def __init__(
         self,
         api_key: str = "",
-        model: str = "google/gemini-2.5-flash",
+        model: str = "qwen/qwen3.8-27b",
+        provider: str = "groq",
         config_path: Path = Path("config.json"),
     ) -> None:
         self.api_key = api_key.strip()
-        self.model = model.strip() or "google/gemini-2.5-flash"
+        self.provider = provider
+        if self.api_key.startswith("gsk_"):
+            self.provider = "groq"
+        elif self.api_key.startswith("sk-or-"):
+            self.provider = "openrouter"
+
+        self.model = model.strip() or ("qwen/qwen3.8-27b" if self.provider == "groq" else "google/gemini-2.5-flash")
         self.config_path = config_path
 
         # Default ROI (left, top, right, bottom)
@@ -109,11 +117,17 @@ class ChatVisionTranslator:
         self._load_roi_from_config()
 
     def set_api_key(self, key: str) -> None:
-        """Update OpenRouter API Key."""
+        """Update API Key and auto-detect provider."""
         self.api_key = key.strip()
+        if self.api_key.startswith("gsk_"):
+            self.provider = "groq"
+            if self.model.startswith("google/"):
+                self.model = "qwen/qwen3.8-27b"
+        elif self.api_key.startswith("sk-or-"):
+            self.provider = "openrouter"
 
     def set_model(self, model: str) -> None:
-        """Update OpenRouter Model."""
+        """Update Model."""
         self.model = model.strip()
 
     def _load_roi_from_config(self) -> None:
@@ -159,6 +173,63 @@ class ChatVisionTranslator:
         except Exception as e:
             logger.error("Failed to save ROI to config.json: %s", e)
 
+    def _extract_text_ocr(self, img: Image.Image) -> str:
+        """Extract text from screenshot using native Windows OCR or pytesseract (rus+eng)."""
+        # 1. Try Windows OCR (winocr) - natively supports en-US, ru, zh-Hans-CN without external downloads
+        try:
+            import winocr
+            from PIL import ImageOps
+            langs = ["zh-Hans-CN", "ru", "en-US"]
+            results: List[str] = []
+
+            for lang in langs:
+                try:
+                    res = winocr.recognize_pil_sync(img, lang)
+                    t = (res.get("text") or "").strip() if isinstance(res, dict) else str(getattr(res, "text", "")).strip()
+                    if t:
+                        results.append(t)
+                except Exception:
+                    pass
+
+            # Invert colors for light text on dark Dota 2 chat background
+            try:
+                inv = ImageOps.invert(img.convert("RGB"))
+                for lang in langs:
+                    try:
+                        res = winocr.recognize_pil_sync(inv, lang)
+                        t = (res.get("text") or "").strip() if isinstance(res, dict) else str(getattr(res, "text", "")).strip()
+                        if t:
+                            results.append(t)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            if results:
+                unique_lines = []
+                seen = set()
+                for block in results:
+                    for line in block.splitlines():
+                        clean = line.strip()
+                        if len(clean) >= 2 and clean not in seen:
+                            seen.add(clean)
+                            unique_lines.append(clean)
+                if unique_lines:
+                    return "\n".join(unique_lines)
+        except Exception as e:
+            logger.debug("WinOCR recognition error: %s", e)
+
+        # 2. Fallback to pytesseract (rus+eng only, no chi_sim needed)
+        try:
+            import pytesseract
+            t = pytesseract.image_to_string(img, lang="rus+eng", config="--psm 6").strip()
+            if t:
+                return t
+        except Exception:
+            pass
+
+        return ""
+
     def capture_and_translate_async(self) -> bool:
         """
         Trigger async capture and translation in background thread.
@@ -182,7 +253,7 @@ class ChatVisionTranslator:
         return True
 
     def _worker_capture_and_translate(self) -> None:
-        """Worker thread executing capture, base64 encoding, and OpenRouter API request."""
+        """Worker thread executing capture, OCR/encoding, and Groq/OpenRouter API request."""
         try:
             if self.on_status_change:
                 self.on_status_change("📸 Захват области экрана...")
@@ -207,24 +278,42 @@ class ChatVisionTranslator:
             if img.mode != "RGB":
                 img = img.convert("RGB")
 
-            # 2. Compress to JPEG Base64
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=self.jpeg_quality)
-            jpeg_bytes = buffer.getvalue()
-            b64_str = base64.b64encode(jpeg_bytes).decode("ascii")
-            data_url = f"data:image/jpeg;base64,{b64_str}"
-
             if not self.api_key:
-                logger.warning("OpenRouter API key is not set.")
+                logger.warning("Translation API key is not set.")
                 if self.on_error:
-                    self.on_error("OpenRouter API ключ не указан в config.json!")
+                    self.on_error("API ключ перевода (Groq / OpenRouter) не указан в config.json!")
                 return
 
-            if self.on_status_change:
-                self.on_status_change("🤖 Отправка в нейросеть (Vision)...")
+            is_groq = self.provider == "groq" or self.api_key.startswith("gsk_")
 
-            # 3. Call OpenRouter API
-            messages = self._send_openrouter_vision(data_url)
+            if is_groq:
+                if self.on_status_change:
+                    self.on_status_change("🔍 Распознавание текста чата...")
+
+                text = self._extract_text_ocr(img)
+                if not text:
+                    logger.info("OCR did not detect any readable text in the chat area.")
+                    if self.on_status_change:
+                        self.on_status_change("ℹ️ Сообщений в чате не обнаружено")
+                    if self.on_translation_success:
+                        self.on_translation_success([])
+                    return
+
+                if self.on_status_change:
+                    self.on_status_change("⚡ AI-перевод через Groq...")
+
+                messages = self._send_groq_translation(text)
+            else:
+                if self.on_status_change:
+                    self.on_status_change("🤖 Отправка в нейросеть (Vision)...")
+
+                buffer = io.BytesIO()
+                img.save(buffer, format="JPEG", quality=self.jpeg_quality)
+                jpeg_bytes = buffer.getvalue()
+                b64_str = base64.b64encode(jpeg_bytes).decode("ascii")
+                data_url = f"data:image/jpeg;base64,{b64_str}"
+
+                messages = self._send_openrouter_vision(data_url)
 
             if self.on_translation_success:
                 self.on_translation_success(messages)
@@ -242,6 +331,49 @@ class ChatVisionTranslator:
         finally:
             with self._lock:
                 self.queue_busy = False
+
+    def _send_groq_translation(self, text: str) -> List[TranslatedMessage]:
+        """Send chat text to Groq API (openai-compatible) and parse JSON response."""
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        model = self.model if (self.model and not self.model.startswith("google/")) else "qwen/qwen3.8-27b"
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": f"Переведи сообщения игроков из чата Dota 2 строго в указанном формате JSON:\n{text}",
+                },
+            ],
+            "temperature": 0.2,
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=20.0)
+
+        if not response.ok:
+            error_detail = response.text
+            try:
+                err_json = response.json()
+                error_detail = err_json.get("error", {}).get("message", response.text)
+            except Exception:
+                pass
+            raise RuntimeError(f"Groq HTTP {response.status_code}: {error_detail}")
+
+        res_json = response.json()
+        choices = res_json.get("choices", [])
+        if not choices:
+            return []
+
+        raw_content = choices[0].get("message", {}).get("content", "").strip()
+        logger.debug("Groq raw response: %s", raw_content)
+        return self._parse_json_messages(raw_content)
 
     def _send_openrouter_vision(self, image_data_url: str) -> List[TranslatedMessage]:
         """Send multimodal request to OpenRouter and parse JSON response."""

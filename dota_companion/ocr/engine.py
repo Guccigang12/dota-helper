@@ -15,8 +15,8 @@ from ..core.logger import get_logger
 log = get_logger("ocr")
 
 TESS_LANGS = {
-    "all": "rus+eng+chi_sim",
-    "ch": "chi_sim+eng+rus",
+    "all": "rus+eng",
+    "ch": "eng+rus",
     "en": "eng+rus",
     "latin": "spa+eng+rus",
     "ru": "rus+eng",
@@ -283,7 +283,7 @@ class OcrEngine(QThread):
                 self._paddle_available = False
                 self._paddle = None
 
-        # 5. Tesseract OCR (поддерживает мультиязычность chi_sim+rus+eng)
+        # 5. Tesseract OCR (rus+eng)
         self._ensure_tesseract_setup()
 
         if self._tesseract_available:
@@ -300,7 +300,7 @@ class OcrEngine(QThread):
                 pass
 
             # Если основной язык Tesseract ничего не дал, пробуем другие установленные языки
-            for alt_l in ["rus+eng", "chi_sim+eng", "spa+eng"]:
+            for alt_l in ["rus+eng", "spa+eng"]:
                 try:
                     alt_res = self._run_tesseract(image, alt_lang=alt_l)
                     if alt_res and alt_res.strip():

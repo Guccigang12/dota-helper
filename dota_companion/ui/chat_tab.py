@@ -345,7 +345,7 @@ class ChatTab(QWidget):
             self._key_input.setPlaceholderText("gsk_...")
             self._model_label.setVisible(True)
             self._model_input.setVisible(True)
-            self._model_input.setText(s.groq_model or "llama-3.3-70b-versatile")
+            self._model_input.setText(s.groq_model or "qwen/qwen3.8-27b")
             self._provider_hint.setText(
                 "⚡ Сверхбыстрый перевод (~0.2с). Бесплатный ключ на console.groq.com (14 400 запросов/день)."
             )
@@ -414,7 +414,7 @@ class ChatTab(QWidget):
             self._settings.custom_api_key = self._key_input.text().strip()
         elif provider == "groq":
             self._settings.groq_api_key = self._key_input.text().strip()
-            self._settings.groq_model = self._model_input.text().strip() or "llama-3.3-70b-versatile"
+            self._settings.groq_model = self._model_input.text().strip() or "qwen/qwen3.8-27b"
         elif provider == "openrouter":
             self._settings.openrouter_api_key = self._key_input.text().strip()
             self._settings.openrouter_model = self._model_input.text().strip() or "meta-llama/llama-3.3-70b-instruct:free"
