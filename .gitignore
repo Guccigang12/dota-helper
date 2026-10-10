@@ -7,6 +7,9 @@ venv/
 
 # Настройки и данные приложения
 settings.json
+inventory_cache.db
+prices_cache.json
+*.db
 *.log
 
 # Сборка

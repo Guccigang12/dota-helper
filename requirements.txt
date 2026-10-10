@@ -1,22 +1,10 @@
-# === Dota Companion: базовые зависимости ===
-PyQt6>=6.7
-aiohttp>=3.9
-mss>=9.0
-Pillow>=10.3
-numpy>=1.26
-
-# === Звук (SoundPad) ===
-sounddevice>=0.4.6
-soundfile>=0.12.1      # WAV / FLAC / OGG
-imageio-ffmpeg>=0.4.7  # MP3 (декодер ffmpeg)
-miniaudio>=1.59        # MP3 (fallback)
-
-# === OCR: движок №1 — Windows OCR (встроен в Windows 10/11, рекомендуются) ===
-winocr>=0.0.15
-
-# === OCR: вариант B — PaddleOCR (китайский/английский/испанский) ===
-# Устанавливается отдельно при необходимости:
-#   pip install paddlepaddle paddleocr
-
-# === OCR: вариант C — Tesseract (fallback) ===
-pytesseract>=0.3.10
+# DotaHelper Dependencies (VAC-Safe Companion)
+PyQt6>=6.7.0
+requests>=2.31.0
+aiohttp>=3.9.0
+keyboard>=0.13.5
+Pillow>=10.0.0
+vdf>=3.4
+psutil>=5.9.0
+mss>=9.0.0
+PySocks>=1.7.1
